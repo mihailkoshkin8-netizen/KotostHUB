@@ -3063,22 +3063,54 @@ function Movement.installEyeLasers(context)
 	local settings = context.configuration.eyeLasers
 	local MAX_LENGTH = 40 -- how far the beams reach, in studs
 	local HIT_RADIUS = 1.6 -- how close another player must get to a beam to be flung
-	local DOT_COUNT = 5 -- white "crawling" dots per beam
-	local BEAM_COLOR = color3.fromRGB(140, 230, 255)
-	local state = {beams = {}, cooldowns = {}}
+	-- laser styles: color, dots, extra effects
+	local STYLES = {
+		{name = "Ice", color = color3.fromRGB(140, 230, 255), dot = color3.new(1, 1, 1), w0 = 0.12, w1 = 0.04, dots = 5},
+		{name = "Crimson", color = color3.fromRGB(255, 35, 35), dot = color3.fromRGB(255, 190, 120), w0 = 0.2, w1 = 0.08, dots = 6, glow = true, sparks = true},
+		{name = "Rainbow", color = color3.new(1, 0, 0), dot = color3.new(1, 1, 1), w0 = 0.16, w1 = 0.06, dots = 7, rainbow = true, glow = true},
+		{name = "Plasma", color = color3.fromRGB(200, 70, 255), dot = color3.fromRGB(255, 160, 255), w0 = 0.22, w1 = 0.1, dots = 5, glow = true, pulse = true, sparks = true},
+		{name = "Lightning", color = color3.fromRGB(120, 170, 255), dot = color3.fromRGB(230, 240, 255), w0 = 0.1, w1 = 0.1, dots = 4, zap = true, sparks = true},
+		{name = "Gold", color = color3.fromRGB(255, 200, 60), dot = color3.fromRGB(255, 255, 200), w0 = 0.16, w1 = 0.06, dots = 6, glow = true, sparks = true},
+		{name = "Toxic", color = color3.fromRGB(90, 255, 60), dot = color3.fromRGB(200, 255, 140), w0 = 0.18, w1 = 0.08, dots = 6, pulse = true, sparks = true},
+		{name = "Void", color = color3.fromRGB(12, 0, 22), dot = color3.fromRGB(170, 60, 255), w0 = 0.2, w1 = 0.1, dots = 6, glow = true, glowColor = color3.fromRGB(150, 40, 255), dark = true, sparks = true},
+	}
+	local function styleByName(name)
+		for _, style in ipairs(STYLES) do if style.name == name then return style end end
+		return STYLES[1]
+	end
+	if type(settings.style) ~= "string" then settings.style = "Ice" end
+	local state = {beams = {}, cooldowns = {}, style = nil}
 
 	local function destroyVisuals()
 		for _, entry in ipairs(state.beams) do
 			pcall(function() entry.beam:Destroy() end)
+			if entry.glow then pcall(function() entry.glow:Destroy() end) end
+			if entry.impact then pcall(function() entry.impact:Destroy() end) end
 			pcall(function() entry.origin:Destroy() end)
 			pcall(function() entry.target:Destroy() end)
 			for _, dot in ipairs(entry.dots) do pcall(function() dot:Destroy() end) end
 		end
 		state.beams = {}
+		state.style = nil
+	end
+	local function makeBeam(origin, target, color, width0, width1, transparency, emission, parent)
+		local beam = environment.Instance.new("Beam")
+		beam.Name = "KotostEyeLaserBeam"
+		beam.Attachment0, beam.Attachment1 = origin, target
+		beam.Width0, beam.Width1 = width0, width1
+		beam.Color = environment.ColorSequence.new(color)
+		beam.Transparency = environment.NumberSequence.new(transparency)
+		beam.LightEmission = emission
+		beam.FaceCamera = true
+		beam.Segments = 16
+		beam.Parent = parent
+		return beam
 	end
 	local function ensureVisuals(head)
-		if state.beams[1] and state.beams[1].head == head and state.beams[1].beam.Parent then return end
+		local style = styleByName(settings.style)
+		if state.beams[1] and state.beams[1].head == head and state.beams[1].beam.Parent and state.style == style then return end
 		destroyVisuals()
+		state.style = style
 		for _, side in ipairs({-1, 1}) do
 			local origin = environment.Instance.new("Attachment")
 			origin.Name = "KotostEyeLaserOrigin"
@@ -3087,65 +3119,132 @@ function Movement.installEyeLasers(context)
 			local target = environment.Instance.new("Attachment")
 			target.Name = "KotostEyeLaserTarget"
 			target.Parent = head
-			local beam = environment.Instance.new("Beam")
-			beam.Name = "KotostEyeLaserBeam"
-			beam.Attachment0, beam.Attachment1 = origin, target
-			beam.Width0, beam.Width1 = 0.12, 0.04
-			beam.Color = environment.ColorSequence.new(BEAM_COLOR)
-			beam.Transparency = environment.NumberSequence.new(0.15)
-			beam.LightEmission = 1
-			beam.FaceCamera = true
-			beam.Segments = 16
-			beam.Parent = origin
+			local beam = makeBeam(origin, target, style.color, style.w0, style.w1, 0.15, style.dark and 0 or 1, origin)
+			local glow
+			if style.glow then
+				glow = makeBeam(origin, target, style.glowColor or style.color, style.w0 * 3.2, style.w1 * 3.2, 0.72, 1, origin)
+				glow.Name = "KotostEyeLaserGlow"
+			end
 			local dots = {}
-			for _ = 1, DOT_COUNT do
+			for _ = 1, style.dots do
 				local dot = environment.Instance.new("Part")
 				dot.Name = "KotostEyeLaserDot"
 				dot.Shape = enum.PartType.Ball
 				dot.Size = vector.new(0.18, 0.18, 0.18)
 				dot.Material = enum.Material.Neon
-				dot.Color = color3.new(1, 1, 1)
+				dot.Color = style.dot
 				dot.Anchored = true
 				dot.CanCollide, dot.CanQuery, dot.CanTouch = false, false, false
 				dot.Transparency = 1
 				dot.Parent = context.workspace
 				table.insert(dots, dot)
 			end
-			table.insert(state.beams, {head = head, origin = origin, target = target, beam = beam, dots = dots})
+			local impact, emitter, light
+			if style.sparks then
+				pcall(function()
+					impact = environment.Instance.new("Part")
+					impact.Name = "KotostEyeLaserImpact"
+					impact.Shape = enum.PartType.Ball
+					impact.Size = vector.new(0.45, 0.45, 0.45)
+					impact.Material = enum.Material.Neon
+					impact.Color = style.glowColor or style.color
+					impact.Anchored = true
+					impact.CanCollide, impact.CanQuery, impact.CanTouch = false, false, false
+					impact.Transparency = 1
+					light = environment.Instance.new("PointLight")
+					light.Color, light.Brightness, light.Range, light.Shadows = style.glowColor or style.color, 2, 8, false
+					light.Enabled = false
+					light.Parent = impact
+					emitter = environment.Instance.new("ParticleEmitter")
+					emitter.Name = "KotostEyeLaserSparks"
+					emitter.Color = environment.ColorSequence.new(style.dot, style.glowColor or style.color)
+					emitter.LightEmission = 1
+					emitter.Rate = 45
+					emitter.Lifetime = environment.NumberRange.new(0.15, 0.35)
+					emitter.Speed = environment.NumberRange.new(6, 12)
+					emitter.SpreadAngle = environment.Vector2.new(180, 180)
+					emitter.Size = environment.NumberSequence.new(0.18, 0)
+					emitter.Enabled = false
+					emitter.Parent = impact
+					impact.Parent = context.workspace
+				end)
+			end
+			table.insert(state.beams, {head = head, origin = origin, target = target, beam = beam, glow = glow, dots = dots,
+				impact = impact, emitter = emitter, light = light})
 		end
-	end
-	local function hideVisuals()
-		for _, entry in ipairs(state.beams) do for _, dot in ipairs(entry.dots) do dot.Transparency = 1 end end
 	end
 
 	local params
 	context.connect(context.runService.Heartbeat, function()
 		local active = globals.__kotostFlyActive and settings.on
 		if not active then
-			if state.beams[1] then hideVisuals() end
+			-- fly or lasers turned off: remove everything until next activation
+			if state.beams[1] then destroyVisuals() end
 			return
 		end
 		local character = context.player.Character
 		local head = character and character:FindFirstChild("Head")
-		if not head then return end
+		if not head then
+			if state.beams[1] then destroyVisuals() end
+			return
+		end
 		ensureVisuals(head)
+		local style = state.style or STYLES[1]
 		if not params then
 			params = environment.RaycastParams.new()
 			params.FilterType = enum.RaycastFilterType.Exclude
 		end
-		params.FilterDescendantsInstances = {character}
+		local ignore = {character}
+		for _, entry in ipairs(state.beams) do
+			for _, dot in ipairs(entry.dots) do table.insert(ignore, dot) end
+			if entry.impact then table.insert(ignore, entry.impact) end
+		end
+		params.FilterDescendantsInstances = ignore
 		local now = environment.os.clock()
 		local direction = head.CFrame.LookVector
+		local tint
+		if style.rainbow then
+			local hue = (now * 0.25) % 1
+			tint = {color3.fromHSV(hue, 1, 1), color3.fromHSV((hue + 0.15) % 1, 1, 1)}
+		end
+		local pulse = style.pulse and (1 + 0.35 * math.sin(now * 12)) or 1
 		for _, entry in ipairs(state.beams) do
 			local originPosition = entry.origin.WorldPosition
 			local hit = context.workspace:Raycast(originPosition, direction * MAX_LENGTH, params)
 			local endPosition = hit and hit.Position or (originPosition + direction * MAX_LENGTH)
 			entry.target.WorldPosition = endPosition
 			local length = (endPosition - originPosition).Magnitude
+			pcall(function()
+				if tint then
+					local sequence = environment.ColorSequence.new(tint[1], tint[2])
+					entry.beam.Color = sequence
+					if entry.glow then entry.glow.Color = sequence end
+				end
+				if style.pulse then
+					entry.beam.Width0, entry.beam.Width1 = style.w0 * pulse, style.w1 * pulse
+					if entry.glow then entry.glow.Width0, entry.glow.Width1 = style.w0 * 3.2 * pulse, style.w1 * 3.2 * pulse end
+				end
+				if style.zap then
+					entry.beam.CurveSize0 = (math.random() - 0.5) * 3
+					entry.beam.CurveSize1 = (math.random() - 0.5) * 3
+					entry.beam.Transparency = environment.NumberSequence.new(math.random() < 0.15 and 0.7 or 0.05)
+				end
+			end)
 			for index, dot in ipairs(entry.dots) do
 				local offset = (now * 1.6 + index / #entry.dots) % 1
 				dot.Position = originPosition + direction * (length * offset)
 				dot.Transparency = length < 0.5 and 1 or 0.1
+				if tint then dot.Color = tint[(index % 2) + 1] end
+			end
+			if entry.impact then
+				local showImpact = hit ~= nil
+				pcall(function()
+					entry.impact.Position = endPosition
+					entry.impact.Transparency = showImpact and 0.25 or 1
+					if tint then entry.impact.Color = tint[1] end
+					if entry.emitter then entry.emitter.Enabled = showImpact end
+					if entry.light then entry.light.Enabled = showImpact end
+				end)
 			end
 			for _, player in ipairs(context.players:GetPlayers()) do
 				if player == context.player then continue end
@@ -3168,11 +3267,21 @@ function Movement.installEyeLasers(context)
 		end
 	end)
 
+	local styleOptions = {}
+	for _, style in ipairs(STYLES) do table.insert(styleOptions, {code = style.name, label = style.name}) end
 	context.section:ToggleKey({Text = "Eye Lasers", Default = context.defaults.eyeLasers.on,
 		Bind = globals.__kotostBindFromName(settings.key or ""), Callback = function(enabled)
 			settings.on = enabled and true or false
-			if not settings.on then hideVisuals() end
-		end, OnBind = function(key) settings.key = key and key.Name or "" end})
+			if not settings.on then destroyVisuals() end
+		end, OnBind = function(key) settings.key = key and key.Name or "" end,
+		Settings = function()
+			context.section:Dropdown({Text = "Laser style", Options = styleOptions, Default = styleByName(settings.style).name,
+				TranslateOptions = false, Callback = function(value)
+					if type(value) ~= "string" then return end
+					settings.style = styleByName(value).name
+					destroyVisuals() -- rebuilt next frame with the new style
+				end})
+		end})
 
 	return function()
 		settings.on = false
@@ -4160,7 +4269,7 @@ function Configuration.defaults(versions)
 		noclipCam = {on = false, key = ""},
 		spin = {on = false, key = "", speed = 10},
 		fly = {on = false, key = "", speed = 60, method = "Classic"},
-		eyeLasers = {on = false, key = ""}, pounce = {on = false, key = ""},
+		eyeLasers = {on = false, key = "", style = "Ice"}, pounce = {on = false, key = ""},
 		fakepos = {on = false, mode = "Orbit", rate = 6, amp = 3, face = true},
 		xray = {on = false, strength = 0.7},
 		farm = {method = "Under Map", speed = 21, fastSpeed = 24, tpSpeed = 25, tpDelay = 3,
@@ -11401,6 +11510,7 @@ function Translation.create()
 			["Lamp shadows"] = "Тени от ламп",
 			["Language"] = "Язык",
 			["Laser"] = "Лазер",
+			["Laser style"] = "Стиль лазера",
 			["Last Drop"] = "Последний дроп",
 			["Latitude"] = "Широта",
 			["Launcher button"] = "Кнопка запуска",
@@ -24267,7 +24377,16 @@ function CombatTracer.hideInterface(state)
 		if not container then continue end
 		for _, gui in container:GetChildren() do
 			if not gui:IsA("LayerCollector") or not gui.Enabled then continue end
-			if pcall(function() gui.Enabled = false end) then table.insert(saved.guis, gui) end
+			if pcall(function() gui.Enabled = false end) then
+				table.insert(saved.guis, gui)
+				saved.gameOff, saved.watch = saved.gameOff or {}, saved.watch or {}
+				local target = gui
+				pcall(function()
+					table.insert(saved.watch, target:GetPropertyChangedSignal("Enabled"):Connect(function()
+						if target.Enabled then saved.gameOff[target] = nil; target.Enabled = false end
+					end))
+				end)
+			end
 		end
 	end
 	for _, kind in environment.Enum.CoreGuiType:GetEnumItems() do
@@ -24301,7 +24420,8 @@ end
 
 function CombatTracer.restoreInterface(state, saved)
 	local context, environment = state.context, state.context.environment
-	for _, gui in saved.guis do pcall(function() if gui.Parent then gui.Enabled = true end end) end
+	for _, gui in saved.guis do pcall(function() if gui.Parent and not (saved.gameOff and saved.gameOff[gui]) then gui.Enabled = true end end) end
+	for _, connection in saved.watch or {} do pcall(function() connection:Disconnect() end) end
 	for kind, enabled in saved.core do pcall(function() context.starterGui:SetCoreGuiEnabled(kind, enabled) end) end
 	if saved.topbar then pcall(function() context.starterGui:SetCore("TopbarEnabled", true) end) end
 	pcall(function() context.inputService.MouseIconEnabled = saved.mouse end)
@@ -28025,12 +28145,45 @@ function GameEffects.unlock(state)
 	local profile = state.profile
 	if not profile or not profile.Effects then return end
 	pcall(function()
-		profile.Effects.Owned = table.clone(state.keys)
+		local owned = profile.Effects.Owned
+		if type(owned) ~= "table" then return end
+		if state.ownedTable ~= owned then state.ownedTable, state.originalOwned = owned, table.clone(owned) end
+		-- keep the game's own data format (list or dictionary) instead of replacing it
+		local isList = #owned > 0 or next(owned) == nil
+		local sample
+		if not isList then for _, value in pairs(owned) do sample = value; break end end
+		local added = 0
+		if isList then
+			local have = {}
+			for _, key in ipairs(owned) do have[tostring(key)] = true end
+			for _, key in ipairs(state.keys) do if not have[key] then table.insert(owned, key); added += 1 end end
+		else
+			for _, key in ipairs(state.keys) do
+				if owned[key] == nil then
+					local value = sample
+					if type(value) == "number" or value == nil then value = 1 elseif type(value) == "table" then value = table.clone(value) end
+					owned[key] = value
+					added += 1
+				end
+			end
+		end
+		-- only notify the game when something actually changed (was: every 3 s -> UI spam / broken rounds)
+		if added == 0 then return end
 		local inventory = state.context.storage.Remotes.Inventory
 		local changed = inventory:FindFirstChild("InventoryDataChanged")
-		if changed then pcall(changed.Fire, changed, "Effects"); pcall(changed.Fire, changed) end
-		local profileChanged = inventory:FindFirstChild("ProfileDataChanged")
-		if profileChanged then pcall(profileChanged.Fire, profileChanged) end
+		if changed then pcall(changed.Fire, changed, "Effects") end
+	end)
+end
+
+function GameEffects.relock(state)
+	local profile, original, owned = state.profile, state.originalOwned, state.ownedTable
+	state.originalOwned, state.ownedTable = nil, nil
+	if not original or not profile or not profile.Effects or profile.Effects.Owned ~= owned or type(owned) ~= "table" then return end
+	pcall(function()
+		for key in pairs(owned) do owned[key] = nil end
+		for key, value in pairs(original) do owned[key] = value end
+		local changed = state.context.storage.Remotes.Inventory:FindFirstChild("InventoryDataChanged")
+		if changed then pcall(changed.Fire, changed, "Effects") end
 	end)
 end
 
@@ -28160,6 +28313,7 @@ function GameEffects.install(context)
 		if state.enabled then GameEffects.load(state); GameEffects.unlock(state); return end
 		state.current = nil
 		for _, target in GameEffects.targets(state) do GameEffects.clear(target) end
+		GameEffects.relock(state)
 	end})
 	context.connect(context.runService.Heartbeat, function() GameEffects.step(state) end)
 	context.connect(context.player.CharacterAdded, function()
@@ -28169,6 +28323,7 @@ function GameEffects.install(context)
 	return state, function()
 		state.alive, state.enabled = false, false
 		for _, target in GameEffects.targets(state) do GameEffects.clear(target) end
+		GameEffects.relock(state)
 	end
 end
 
@@ -36223,7 +36378,7 @@ function SelfChams.displays(state, character)
 	end
 	local folder = state.context.workspace:FindFirstChild("WeaponDisplays")
 	for _, display in folder and folder:GetChildren() or {} do
-		if display.Name:sub(1, 9) == "KotostSkin" then table.insert(result, display) end
+		if display.Name:sub(1, 10) == "KotostSkin" then table.insert(result, display) end
 	end
 	return result
 end
@@ -36801,7 +36956,7 @@ function Optimizer.skip(state, object)
 
 	local ancestor = object
 	while ancestor and ancestor ~= workspace and ancestor ~= lighting do
-		if ancestor.Name:sub(1, 5) == "Kotost" then return true end
+		if ancestor.Name:sub(1, 6) == "Kotost" then return true end
 		ancestor = ancestor.Parent
 	end
 
@@ -36950,7 +37105,7 @@ function Optimizer.applyGlobals(state)
 	pcall(function()
 		if not settings.noPost then Optimizer.restore(state, "post"); return end
 		for _, object in lighting:GetChildren() do
-			if object.Name:sub(1, 5) == "Kotost" then continue end
+			if object.Name:sub(1, 6) == "Kotost" then continue end
 			if object:IsA("PostEffect") and object.Enabled then
 				Optimizer.save(state, "post", object, true)
 				object.Enabled = false
@@ -37641,7 +37796,7 @@ function VisualWorld.remember(state, object, property)
 	if not ok then return nil end
 	properties = properties or {}
 	state.saved[object] = properties
-	properties[property] = {value = value}
+	properties[property] = {value = value, original = value}
 	return properties[property]
 end
 
@@ -37660,7 +37815,11 @@ function VisualWorld.release(state, object, property)
 	pcall(function()
 		local current = object[property]
 		if saved.written and current ~= saved.last then saved.value = current end
-		object[property] = saved.value
+		local restore = saved.value
+		-- on/off of game effects (round fades etc.) may have been toggled by the game while we held it;
+		-- the last seen value can be stale, so fall back to the value from before we touched it
+		if property == "Enabled" and saved.original ~= nil and current == saved.last then restore = saved.original end
+		object[property] = restore
 	end)
 	properties[property] = nil
 	if not next(properties) then state.saved[object] = nil end
@@ -37706,7 +37865,7 @@ function VisualWorld.targets(state, parent, class)
 	local result, seen = {}, {}
 	if not parent then return result end
 	for _, object in ipairs(parent:GetChildren()) do
-		if not state.owned[object] and object:IsA(class) and object.Name:sub(1, 5) ~= "Kotost" and object.Name:sub(1, 4) ~= "KotostUi" then
+		if not state.owned[object] and object:IsA(class) and object.Name:sub(1, 6) ~= "Kotost" and object.Name:sub(1, 8) ~= "KotostUi" then
 			table.insert(result, object)
 			seen[object] = true
 		end
@@ -38108,7 +38267,16 @@ function VisualWorld.install(context)
 	section:Group({Title = "Materials", Side = "Right", Pin = true})
 	dropdown("Materials", "mats", {"Game", "HD Realistic", "HD Worn", "HD Wet"})
 	state.batch = false
-	if context.lighting.Changed then context.connect(context.lighting.Changed, function() if not state.applying then VisualWorld.request(state) end end) end
+	if context.lighting.Changed then context.connect(context.lighting.Changed, function(property)
+		if state.applying then return end
+		local properties = state.saved[context.lighting]
+		local saved = properties and type(property) == "string" and properties[property]
+		if saved and saved.written then
+			local ok, current = pcall(function() return context.lighting[property] end)
+			if ok and current == saved.last then return end
+		end
+		VisualWorld.request(state)
+	end) end
 	if context.lighting.ChildAdded then context.connect(context.lighting.ChildAdded, function(object)
 		if not state.applying and not state.owned[object] then VisualWorld.request(state) end
 	end) end
@@ -38495,14 +38663,14 @@ end
 
 function TexturePack.eligible(state, part)
 	if not part:IsA("BasePart") or part:IsA("Terrain") or part.Transparency >= 0.95 or part.MaterialVariant ~= "" then return false end
-	if part.Name:sub(1, 5) == "Kotost" then return false end
+	if part.Name:sub(1, 6) == "Kotost" then return false end
 	if part:IsA("MeshPart") and part.TextureID ~= "" then return false end
 	local workspace = state.context.workspace
 	if workspace.CurrentCamera and part:IsDescendantOf(workspace.CurrentCamera) then return false end
 	local parent = part.Parent
 	while parent and parent ~= workspace do
 		if parent:IsA("Model") and parent:FindFirstChildOfClass("Humanoid") then return false end
-		if parent:IsA("Tool") or parent:IsA("Accessory") or parent.Name == "CoinContainer" or parent.Name:sub(1, 5) == "Kotost" then return false end
+		if parent:IsA("Tool") or parent:IsA("Accessory") or parent.Name == "CoinContainer" or parent.Name:sub(1, 6) == "Kotost" then return false end
 		parent = parent.Parent
 	end
 	return true
