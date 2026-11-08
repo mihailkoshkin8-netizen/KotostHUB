@@ -7215,9 +7215,33 @@ function OfflineEnvironment.create(host, hostGame)
 	environment.workspace = services.workspace
 	environment.__offlineMethod = services.method
 	environment.__offlineAddress = OfflineRequests.address
+	local function findHost(...)
+		for _, name in ipairs({...}) do
+			local ok, value = pcall(lookup, name)
+			if ok and type(value) == "function" then return value end
+		end
+		return nil
+	end
+	local hostSetIdentity = findHost("setthreadidentity", "set_thread_identity", "setidentity", "setthreadcontext")
+	local hostGetIdentity = findHost("getthreadidentity", "get_thread_identity", "getidentity", "getthreadcontext")
+	local requireCache = {}
+	-- game modules must be required with the game's own script identity (2); requiring them with the
+	-- executor identity marks them as RobloxScript and breaks every game script that requires them later
+	-- ("Cannot require a RobloxScript module from a non RobloxScript context" -> black screen, broken GUI, Animate)
 	environment.require = function(module)
 		assert(typeof(module) == "Instance" and module:IsA("ModuleScript"), "External require disabled")
-		return host.require(module)
+		if requireCache[module] ~= nil then return requireCache[module] end
+		local previous = 8
+		if hostGetIdentity then
+			local ok, value = pcall(hostGetIdentity)
+			if ok and type(value) == "number" then previous = value end
+		end
+		if hostSetIdentity then pcall(hostSetIdentity, 2) end
+		local ok, result = pcall(host.require, module)
+		if hostSetIdentity then pcall(hostSetIdentity, previous) end
+		if not ok then error(result, 0) end
+		requireCache[module] = result
+		return result
 	end
 
 	environment.loadstring = function(source)
@@ -47004,7 +47028,9 @@ function KotostApplication.Trolly.cutLine(state, scene, line)
 	if scene.who ~= line.who then scene.who, scene.whoAt = line.who, os.clock() end
 	state.cutLayout.Padding = environment.UDim.new(0, line.wobble and 2 or 12)
 	local guide = line.who == "t"
-	state.cutWho.Text = string.upper(guide and "Kotost" or "АНДРЕЙ")
+	local me = state.context.player or environment.game:GetService("Players").LocalPlayer
+	local myName = me and (me.DisplayName ~= "" and me.DisplayName or me.Name) or "Player"
+	state.cutWho.Text = string.upper(guide and "Kotost" or myName)
 	state.cutWho.BackgroundColor3 = guide and environment.Color3.fromRGB(217, 54, 69) or environment.Color3.new(1, 1, 1)
 	state.cutWho.TextColor3 = guide and environment.Color3.new(1, 1, 1) or environment.Color3.fromRGB(18, 18, 24)
 	for index, word in ipairs(line.words) do
