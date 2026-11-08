@@ -2679,6 +2679,7 @@ function Movement.installSpinAndBhop(context)
 end
 
 function Movement.installFly(context)
+	local KOTOST_FLY_ANIMATION_ID = 0 -- TODO: paste your own flying animation id number here (0 = no animation)
 	local environment = context.environment
 	local enum, vector, cframe = environment.Enum, environment.Vector3, environment.CFrame
 	local states = enum.HumanoidStateType
@@ -2734,11 +2735,35 @@ function Movement.installFly(context)
 			pcall(function() humanoid:SetStateEnabled(enabled, true) end)
 		end
 	end
+	local function stopFlyAnimation()
+		if state.flyTrack then pcall(state.flyTrack.Stop, state.flyTrack, 0.2) end
+		state.flyTrack = nil
+	end
+	local function startFlyAnimation(humanoid)
+		stopFlyAnimation()
+		if KOTOST_FLY_ANIMATION_ID == 0 then return end
+		local animator = humanoid:FindFirstChildOfClass("Animator")
+		if not animator then return end
+		local ok, animation = pcall(function()
+			local object = environment.Instance.new("Animation")
+			object.AnimationId = "rbxassetid://" .. KOTOST_FLY_ANIMATION_ID
+			return object
+		end)
+		if not ok then return end
+		local okTrack, track = pcall(animator.LoadAnimation, animator, animation)
+		animation:Destroy()
+		if not okTrack then return end
+		track.Looped = true
+		track.Priority = enum.AnimationPriority.Action
+		track:Play(0.2)
+		state.flyTrack = track
+	end
 	local function cleanup()
 		local humanoid = state.humanoid
 		local character = humanoid and humanoid.Parent
 		local savedStates = state.savedStates
 		state.savedStates = nil
+		stopFlyAnimation()
 		if humanoid and savedStates then
 			for value, enabled in pairs(savedStates) do pcall(function() humanoid:SetStateEnabled(value, enabled) end) end
 			if humanoid.Parent and humanoid.Health > 0 then pcall(function() humanoid:ChangeState(states.Freefall) end) end
@@ -2952,6 +2977,7 @@ function Movement.installFly(context)
 			if state.method then cleanup() end
 			state.method, state.humanoid, state.root = method, humanoid, root
 			methods[method].start(humanoid, root)
+			startFlyAnimation(humanoid)
 		end
 		delta = math.clamp(tonumber(delta) or 1 / 60, 0, 0.1)
 		local movement, vertical, forward = direction(humanoid)
@@ -2974,6 +3000,198 @@ function Movement.installFly(context)
 		globals.__kotostFlyActive = false
 		cleanup()
 	end
+end
+
+function Movement.installEyeLasers(context)
+	local environment = context.environment
+	local vector, color3, enum = environment.Vector3, environment.Color3, environment.Enum
+	local globals = environment.getgenv()
+	local settings = context.configuration.eyeLasers
+	local MAX_LENGTH = 40 -- how far the beams reach, in studs
+	local HIT_RADIUS = 1.6 -- how close another player must get to a beam to be flung
+	local DOT_COUNT = 5 -- white "crawling" dots per beam
+	local BEAM_COLOR = color3.fromRGB(140, 230, 255)
+	local state = {beams = {}, cooldowns = {}}
+
+	local function destroyVisuals()
+		for _, entry in ipairs(state.beams) do
+			pcall(function() entry.beam:Destroy() end)
+			pcall(function() entry.origin:Destroy() end)
+			pcall(function() entry.target:Destroy() end)
+			for _, dot in ipairs(entry.dots) do pcall(function() dot:Destroy() end) end
+		end
+		state.beams = {}
+	end
+	local function ensureVisuals(head)
+		if state.beams[1] and state.beams[1].head == head and state.beams[1].beam.Parent then return end
+		destroyVisuals()
+		for _, side in ipairs({-1, 1}) do
+			local origin = environment.Instance.new("Attachment")
+			origin.Name = "KotostEyeLaserOrigin"
+			origin.Position = vector.new(side * 0.35, 0.05, -0.5)
+			origin.Parent = head
+			local target = environment.Instance.new("Attachment")
+			target.Name = "KotostEyeLaserTarget"
+			target.Parent = head
+			local beam = environment.Instance.new("Beam")
+			beam.Name = "KotostEyeLaserBeam"
+			beam.Attachment0, beam.Attachment1 = origin, target
+			beam.Width0, beam.Width1 = 0.12, 0.04
+			beam.Color = environment.ColorSequence.new(BEAM_COLOR)
+			beam.Transparency = environment.NumberSequence.new(0.15)
+			beam.LightEmission = 1
+			beam.FaceCamera = true
+			beam.Segments = 16
+			beam.Parent = origin
+			local dots = {}
+			for _ = 1, DOT_COUNT do
+				local dot = environment.Instance.new("Part")
+				dot.Name = "KotostEyeLaserDot"
+				dot.Shape = enum.PartType.Ball
+				dot.Size = vector.new(0.18, 0.18, 0.18)
+				dot.Material = enum.Material.Neon
+				dot.Color = color3.new(1, 1, 1)
+				dot.Anchored = true
+				dot.CanCollide, dot.CanQuery, dot.CanTouch = false, false, false
+				dot.Transparency = 1
+				dot.Parent = context.workspace
+				table.insert(dots, dot)
+			end
+			table.insert(state.beams, {head = head, origin = origin, target = target, beam = beam, dots = dots})
+		end
+	end
+	local function hideVisuals()
+		for _, entry in ipairs(state.beams) do for _, dot in ipairs(entry.dots) do dot.Transparency = 1 end end
+	end
+
+	local params
+	context.connect(context.runService.Heartbeat, function()
+		local active = globals.__kotostFlyActive and settings.on
+		if not active then
+			if state.beams[1] then hideVisuals() end
+			return
+		end
+		local character = context.player.Character
+		local head = character and character:FindFirstChild("Head")
+		if not head then return end
+		ensureVisuals(head)
+		if not params then
+			params = environment.RaycastParams.new()
+			params.FilterType = enum.RaycastFilterType.Exclude
+		end
+		params.FilterDescendantsInstances = {character}
+		local now = environment.os.clock()
+		local direction = head.CFrame.LookVector
+		for _, entry in ipairs(state.beams) do
+			local originPosition = entry.origin.WorldPosition
+			local hit = context.workspace:Raycast(originPosition, direction * MAX_LENGTH, params)
+			local endPosition = hit and hit.Position or (originPosition + direction * MAX_LENGTH)
+			entry.target.WorldPosition = endPosition
+			local length = (endPosition - originPosition).Magnitude
+			for index, dot in ipairs(entry.dots) do
+				local offset = (now * 1.6 + index / #entry.dots) % 1
+				dot.Position = originPosition + direction * (length * offset)
+				dot.Transparency = length < 0.5 and 1 or 0.1
+			end
+			for _, player in ipairs(context.players:GetPlayers()) do
+				if player == context.player then continue end
+				local otherCharacter = player.Character
+				local otherRoot = otherCharacter and otherCharacter:FindFirstChild("HumanoidRootPart")
+				local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
+				if not otherRoot or not otherHumanoid or otherHumanoid.Health <= 0 then continue end
+				if now - (state.cooldowns[player] or 0) < 1.5 then continue end
+				local toPoint = otherRoot.Position - originPosition
+				local along = math.clamp(toPoint:Dot(direction), 0, length)
+				local closest = originPosition + direction * along
+				if (otherRoot.Position - closest).Magnitude <= HIT_RADIUS then
+					state.cooldowns[player] = now
+					if type(globals.__kotostFlingDown) == "function" then
+						local fling, targetCharacter = globals.__kotostFlingDown, otherCharacter
+						environment.task.spawn(function() pcall(fling, targetCharacter, 0.8) end)
+					end
+				end
+			end
+		end
+	end)
+
+	context.section:ToggleKey({Text = "Eye Lasers", Default = context.defaults.eyeLasers.on,
+		Bind = globals.__kotostBindFromName(settings.key or ""), Callback = function(enabled)
+			settings.on = enabled and true or false
+			if not settings.on then hideVisuals() end
+		end, OnBind = function(key) settings.key = key and key.Name or "" end})
+
+	return function()
+		settings.on = false
+		destroyVisuals()
+	end
+end
+
+function Movement.installDropKick(context)
+	local environment = context.environment
+	local globals = environment.getgenv()
+	local settings = context.configuration.pounce
+	local KOTOST_DROPKICK_ANIMATION_ID = 0 -- TODO: paste your flying two-footed drop-kick animation id number here (0 = no animation)
+	local enabled, params, filtered = false, nil, nil
+
+	local function targetAt(x, y)
+		local camera = context.workspace.CurrentCamera
+		if not camera then return nil end
+		local ray = camera:ViewportPointToRay(x, y)
+		if not params then
+			params = environment.RaycastParams.new()
+			params.FilterType = environment.Enum.RaycastFilterType.Exclude
+		end
+		local character = context.player.Character
+		if filtered ~= character then
+			filtered = character
+			params.FilterDescendantsInstances = {character}
+		end
+		local hit = context.workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+		local model = hit and hit.Instance and hit.Instance:FindFirstAncestorWhichIsA("Model")
+		local player = model and context.players:GetPlayerFromCharacter(model)
+		local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+		if player and player ~= context.player and humanoid and humanoid.Health > 0 then return model end
+		return nil
+	end
+
+	local function playKick()
+		if KOTOST_DROPKICK_ANIMATION_ID == 0 then return end
+		local character = context.player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+		if not animator then return end
+		local ok, animation = pcall(function()
+			local object = environment.Instance.new("Animation")
+			object.AnimationId = "rbxassetid://" .. KOTOST_DROPKICK_ANIMATION_ID
+			return object
+		end)
+		if not ok then return end
+		local okTrack, track = pcall(animator.LoadAnimation, animator, animation)
+		animation:Destroy()
+		if not okTrack then return end
+		track.Priority = environment.Enum.AnimationPriority.Action
+		track:Play(0.05)
+		environment.task.delay(1.2, function() pcall(track.Stop, track, 0.2) end)
+	end
+
+	context.connect(context.inputService.InputBegan, function(input, processed)
+		if not enabled or processed or input.UserInputType ~= environment.Enum.UserInputType.MouseButton1 then return end
+		local position = input.Position
+		local target = targetAt(position.X, position.Y)
+		if not target then return end
+		playKick()
+		if type(globals.__kotostFlingDown) == "function" then
+			local fling = globals.__kotostFlingDown
+			environment.task.spawn(function() pcall(fling, target, 0.8) end)
+		end
+	end)
+
+	context.section:ToggleKey({Text = "Drop Kick", Default = context.defaults.pounce.on,
+		Bind = globals.__kotostBindFromName(settings.key or ""), Callback = function(value)
+			enabled, settings.on = value and true or false, value and true or false
+		end, OnBind = function(key) settings.key = key and key.Name or "" end})
+
+	return function() enabled = false end
 end
 
 function Movement.installSpeed(context)
@@ -3888,6 +4106,7 @@ function Configuration.defaults(versions)
 		noclipCam = {on = false, key = ""},
 		spin = {on = false, key = "", speed = 10},
 		fly = {on = false, key = "", speed = 60, method = "Classic"},
+		eyeLasers = {on = false, key = ""}, pounce = {on = false, key = ""},
 		fakepos = {on = false, mode = "Orbit", rate = 6, amp = 3, face = true},
 		xray = {on = false, strength = 0.7},
 		farm = {method = "Under Map", speed = 21, fastSpeed = 24, tpSpeed = 25, tpDelay = 3,
@@ -11349,7 +11568,7 @@ function Translation.create()
 			["Preview Victory"] = "Прослушать победу",
 			["Private server"] = "Приватный сервер",
 			["Pro Clarity"] = "Чёткость",
-			["Problem? Heh. I'm Trolly, the Kotost Hub guide. Need something?"] = "Проблемы? Хе-хе. Я Тролли, гид Kotost Hub. Чем помочь?",
+			["Problem? Heh. I'm Kotost, your hub guide. Need something?"] = "Проблемы? Хе-хе. Я Котост, гид kotost games hub. Чем помочь?",
 			["Props"] = "Предметы",
 			["Protection"] = "Защита",
 			["Publish config"] = "Публикация конфига",
@@ -11706,9 +11925,9 @@ function Translation.create()
 			["Trending"] = "В тренде",
 			["Troll Fun"] = "Тролл-фан",
 			["Troll"] = "Тролл",
-			["Trolly Dances"] = "Танцы Тролли",
-			["Trolly NPC"] = "Тролли в лобби",
-			["Trolly Volume"] = "Громкость Тролли",
+			["Kotost Dances"] = "Танцы Котоста",
+			["Kotost NPC"] = "Котост в лобби",
+			["Kotost Volume"] = "Громкость Котоста",
 			["Try again in a few seconds"] = "Попробуй через пару секунд",
 			["Try again later"] = "Попробуй позже",
 			["Turn off the heavy stuff: Shaders, Texture Pack, Weather and ESP glow. Your FPS will thank you."] = "Выключи тяжёлое: шейдеры, Texture Pack, погоду и свечение ESP. FPS скажет спасибо.",
@@ -12100,6 +12319,36 @@ function KotostUI.create(environment, nova, options)
 	local minimButton = topButton("\226\128\148", -56, Color3.fromRGB(60, 60, 70))
 	local closeButton = topButton("\226\156\149", -30, Color3.fromRGB(200, 60, 60))
 
+	-- ===== tab search =====
+	local searchOpen = false
+	local searchBox = U.new("TextBox", {Name = "Search", Size = UDim2.fromOffset(0, 24), Position = UDim2.new(1, -136, 0, 4),
+		BackgroundTransparency = 1, ClipsDescendants = true, Text = "", PlaceholderText = "Search tabs", FontFace = Font.Medium(),
+		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, Visible = false, ZIndex = 5, Parent = win})
+	Theme.bind(searchBox, "TextColor3", "Text")
+	Theme.bind(searchBox, "PlaceholderColor3", "Faint")
+	local searchField = U.new("Frame", {Name = "SearchField", Size = UDim2.fromOffset(104, 24), Position = UDim2.new(1, -140, 0, 4),
+		BorderSizePixel = 0, Visible = false, ZIndex = 4, Parent = win})
+	Theme.bind(searchField, "BackgroundColor3", "Elevated")
+	U.corner(searchField, 6)
+	searchBox.Parent = searchField
+	U.pad(searchBox, 0, 6, 0, 24)
+	local searchIcon = topButton("\240\159\148\142", -138, Color3.fromRGB(60, 60, 70))
+	local function setSearchOpen(open)
+		searchOpen = open
+		searchField.Visible, searchBox.Visible = open, open
+		if open then searchBox:CaptureFocus() else searchBox.Text = "" end
+	end
+	searchIcon.MouseButton1Click:Connect(function()
+		Sound.play("click")
+		setSearchOpen(not searchOpen)
+		if not searchOpen then window:Search("") end
+	end)
+	searchBox:GetPropertyChangedSignal("Text"):Connect(function() window:Search(searchBox.Text) end)
+	searchBox.FocusLost:Connect(function(enterPressed)
+		if enterPressed and searchBox.Text ~= "" then return end
+		if searchBox.Text == "" then setSearchOpen(false) end
+	end)
+
 	-- ===== launcher (collapsed icon, top-left) =====
 	local launcher = U.new("Frame", {Name = "Launcher", Size = UDim2.fromOffset(56, 56), Position = UDim2.fromOffset(20, 20),
 		BorderSizePixel = 0, Visible = false, Active = true, Parent = gui})
@@ -12307,6 +12556,8 @@ function KotostUI.create(environment, nova, options)
 				AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = scroll})
 			U.list(right, 8)
 			sub = {Scroll = scroll, Columns = {left, right}, Load = {0, 0}}
+			scroll:SetAttribute("KotostTabName", tab.Name)
+			scroll:SetAttribute("KotostSub", tostring(key))
 			tab.Subs[key] = sub
 			return sub
 		end
@@ -13229,6 +13480,51 @@ function KotostUI.create(environment, nova, options)
 			end)
 			watermark.Text = tostring(watermarkTitle or options.Title or "kotost hub") .. "  |  " .. tostring(fps) .. " fps  |  " .. (ping >= 0 and (tostring(ping) .. " ms") or "N/A")
 		end, window.Conns)
+	end
+
+	-- ===== tab search (data comes from translator.reg, filled in by KotostTab) =====
+	function window:AttachSearch(translator)
+		window.Translator = translator
+	end
+	function window:Search(query)
+		query = string.lower(tostring(query or ""))
+		if query == "" then
+			for _, t in ipairs(window.Tabs) do t.Button.Visible = true end
+			return
+		end
+		local matchedTabs, firstHit = {}, nil
+		local translator = window.Translator
+		if translator and translator.reg then
+			for _, binding in ipairs(translator.reg) do
+				local inst, source = binding.inst, binding.src
+				if inst and inst.Parent and type(source) == "string" and string.find(string.lower(source), query, 1, true) then
+					local scroll = inst:FindFirstAncestorOfClass("ScrollingFrame")
+					local tabName = scroll and scroll:GetAttribute("KotostTabName")
+					if tabName then
+						matchedTabs[tabName] = true
+						if not firstHit then firstHit = {tabName = tabName, subKey = scroll:GetAttribute("KotostSub"), inst = inst, scroll = scroll} end
+					end
+				end
+			end
+		end
+		for _, t in ipairs(window.Tabs) do
+			local nameMatch = string.find(string.lower(t.Name), query, 1, true) ~= nil
+			t.Button.Visible = nameMatch or matchedTabs[t.Name] == true
+		end
+		if firstHit then
+			for _, t in ipairs(window.Tabs) do
+				if t.Name == firstHit.tabName then
+					window:SelectTab(t)
+					if firstHit.subKey and t.SelectSub then pcall(t.SelectSub, t, firstHit.subKey) end
+					E.task.defer(function()
+						if not firstHit.inst.Parent or not firstHit.scroll.Parent then return end
+						local targetY = firstHit.inst.AbsolutePosition.Y - firstHit.scroll.AbsolutePosition.Y + firstHit.scroll.CanvasPosition.Y - 20
+						pcall(function() firstHit.scroll.CanvasPosition = Vector2.new(firstHit.scroll.CanvasPosition.X, math.max(0, targetY)) end)
+					end)
+					break
+				end
+			end
+		end
 	end
 
 	-- ===== destroy =====
@@ -42351,19 +42647,30 @@ function KotostApplication.Trolly.build(state)
 	local ground = context.workspace:Raycast(position + environment.Vector3.new(0, 2, 0), environment.Vector3.new(0, -30, 0), params)
 	if not ground then return end
 
-	local description = environment.Instance.new("HumanoidDescription")
-	local color = environment.Color3.fromRGB(236, 236, 236)
-	for _, property in ipairs({"HeadColor", "TorsoColor", "LeftArmColor", "RightArmColor", "LeftLegColor", "RightLegColor"}) do
-		description[property] = color
+	local KOTOST_SKIN_USER_ID = 11216516601 -- the Roblox account whose avatar Kotost wears
+	local function fallbackDescription()
+		local description = environment.Instance.new("HumanoidDescription")
+		local color = environment.Color3.fromRGB(236, 236, 236)
+		for _, property in ipairs({"HeadColor", "TorsoColor", "LeftArmColor", "RightArmColor", "LeftLegColor", "RightLegColor"}) do
+			description[property] = color
+		end
+		description.HatAccessory = "78557106937297,14926431610"
+		description.BackAccessory, description.ShouldersAccessory, description.WaistAccessory = "110464967322599", "96098589382408", "82801950828150"
+		description.Shirt, description.Pants = 5764463125, 18429601675
+		return description
 	end
-	description.HatAccessory = "78557106937297,14926431610"
-	description.BackAccessory, description.ShouldersAccessory, description.WaistAccessory = "110464967322599", "96098589382408", "82801950828150"
-	description.Shirt, description.Pants = 5764463125, 18429601675
+	local gotRemote, description = pcall(function() return context.players:GetHumanoidDescriptionFromUserId(KOTOST_SKIN_USER_ID) end)
+	if not gotRemote or not description then description = fallbackDescription() end
 
 	local function createModel()
 		return context.players:CreateHumanoidModelFromDescription(description, environment.Enum.HumanoidRigType.R15)
 	end
 	local ok, model = pcall(createModel)
+	if (not ok or not model) and gotRemote then
+		description:Destroy()
+		description = fallbackDescription()
+		ok, model = pcall(createModel)
+	end
 	if not ok or not model then
 		description.HatAccessory, description.BackAccessory = "", ""
 		description.ShouldersAccessory, description.WaistAccessory = "", ""
@@ -42444,7 +42751,7 @@ end
 KotostApplication.Trolly.dialog = {
 	start = {
 		gesture = "wave",
-		text = "Problem? Heh. I'm Trolly, the Kotost Hub guide. Need something?",
+		text = "Problem? Heh. I'm Kotost, your hub guide. Need something?",
 		opts = {{"I have a problem", "help"}, {"Who are you?", "verity"}, {"Bye", false}},
 	},
 	help = {
@@ -46276,7 +46583,7 @@ function KotostApplication.Trolly.cutInterface(state)
 		Padding = environment.UDim.new(0, 10)}, state.cutSubs)
 	state.cutWho = KotostApplication.Trolly.create(state, "TextLabel", {Name = "Who", AutomaticSize = environment.Enum.AutomaticSize.X,
 		Size = environment.UDim2.fromOffset(0, 28), BackgroundColor3 = environment.Color3.fromRGB(217, 54, 69),
-		Font = environment.Enum.Font.GothamBold, TextSize = 15, TextColor3 = environment.Color3.new(1, 1, 1), Text = "", LayoutOrder = 1}, state.cutSubs)
+		Font = environment.Enum.Font.SourceSansBold, TextSize = 16, TextColor3 = environment.Color3.new(1, 1, 1), Text = "", LayoutOrder = 1}, state.cutSubs)
 	KotostApplication.Trolly.create(state, "UICorner", {CornerRadius = environment.UDim.new(0, 14)}, state.cutWho)
 	KotostApplication.Trolly.create(state, "UIPadding", {PaddingLeft = environment.UDim.new(0, 14),
 		PaddingRight = environment.UDim.new(0, 14)}, state.cutWho)
@@ -46295,7 +46602,7 @@ function KotostApplication.Trolly.cutLine(state, scene, line)
 	if scene.who ~= line.who then scene.who, scene.whoAt = line.who, os.clock() end
 	state.cutLayout.Padding = environment.UDim.new(0, line.wobble and 2 or 12)
 	local guide = line.who == "t"
-	state.cutWho.Text = string.upper(guide and "Trolly" or state.context.player.DisplayName)
+	state.cutWho.Text = string.upper(guide and "Kotost" or state.context.player.DisplayName)
 	state.cutWho.BackgroundColor3 = guide and environment.Color3.fromRGB(217, 54, 69) or environment.Color3.new(1, 1, 1)
 	state.cutWho.TextColor3 = guide and environment.Color3.new(1, 1, 1) or environment.Color3.fromRGB(18, 18, 24)
 	for index, word in ipairs(line.words) do
@@ -46304,7 +46611,7 @@ function KotostApplication.Trolly.cutLine(state, scene, line)
 			Size = environment.UDim2.fromOffset(math.ceil(width) + 6, 58), BackgroundTransparency = 1, LayoutOrder = index}, state.cutLineFrame)
 		local label = KotostApplication.Trolly.create(state, "TextLabel", {AnchorPoint = environment.Vector2.new(0.5, 0.5),
 			Position = environment.UDim2.fromScale(0.5, 0.5), Size = environment.UDim2.fromScale(1, 1),
-			BackgroundTransparency = 1, Font = environment.Enum.Font.GothamBold, TextSize = 46, Text = word[2],
+			BackgroundTransparency = 1, Font = environment.Enum.Font.SourceSansBold, TextSize = 46, Text = word[2],
 			TextTransparency = 1, TextStrokeTransparency = 1, ZIndex = 2,
 			TextColor3 = word[3] and environment.Color3.fromRGB(255, 58, 72) or environment.Color3.new(1, 1, 1)}, frame)
 		local scale = KotostApplication.Trolly.create(state, "UIScale", {Scale = 0.3}, label)
@@ -46932,7 +47239,7 @@ function KotostApplication.Trolly.createHud(state)
 	local scale = KotostApplication.Trolly.create(state, "UIScale", {Scale = 1}, tag)
 	KotostApplication.Trolly.create(state, "TextLabel", {Name = "Name", AnchorPoint = environment.Vector2.new(0.5, 1),
 		Position = environment.UDim2.new(0.5, 0, 1, -15), Size = environment.UDim2.fromOffset(240, 26),
-		BackgroundTransparency = 1, Font = environment.Enum.Font.GothamBold, TextSize = 24, Text = "Trolly",
+		BackgroundTransparency = 1, Font = environment.Enum.Font.GothamBold, TextSize = 24, Text = "Kotost",
 		TextColor3 = environment.Color3.new(1, 1, 1), TextStrokeColor3 = environment.Color3.fromRGB(10, 6, 8),
 		TextStrokeTransparency = 0.45}, tag)
 	local subtitle = KotostApplication.Trolly.create(state, "TextLabel", {Name = "Sub", AnchorPoint = environment.Vector2.new(0.5, 1),
@@ -47060,7 +47367,7 @@ end
 function KotostApplication.Trolly.createPrompt(state)
 	local environment = state.context.environment
 	state.prompt = KotostApplication.Trolly.create(state, "ProximityPrompt", {
-		Name = "Talk", ActionText = state.context.translation.tr("Talk"), ObjectText = "Trolly",
+		Name = "Talk", ActionText = state.context.translation.tr("Talk"), ObjectText = "Kotost",
 		KeyboardKeyCode = environment.Enum.KeyCode.G, HoldDuration = 0, MaxActivationDistance = 10,
 		RequiresLineOfSight = false, Style = environment.Enum.ProximityPromptStyle.Custom,
 	}, state.root)
@@ -47343,19 +47650,19 @@ function KotostApplication.installGeneral(context)
 	context.section:Slider({Text = "Screen Stretch", Min = 0, Max = 100,
 		Default = math.floor((context.defaults.ui.stretch or 0) + 0.5), Decimals = 0, Suffix = "%",
 		Callback = function(value) settings.ui.stretch = value end})
-	context.section:Toggle({Text = "Trolly NPC", Default = type(context.defaults.npc) ~= "table" or context.defaults.npc.on ~= false,
+	context.section:Toggle({Text = "Kotost NPC", Default = type(context.defaults.npc) ~= "table" or context.defaults.npc.on ~= false,
 		Callback = function(enabled)
 			if type(settings.npc) ~= "table" then settings.npc = {} end
 			settings.npc.on = enabled
 			local npc = environment.getgenv().__kotostNpc
 			if npc then npc.setOn(enabled) end
 		end})
-	context.section:Toggle({Text = "Trolly Dances", Default = type(context.defaults.npc) ~= "table" or context.defaults.npc.dances ~= false,
+	context.section:Toggle({Text = "Kotost Dances", Default = type(context.defaults.npc) ~= "table" or context.defaults.npc.dances ~= false,
 		Callback = function(enabled)
 			if type(settings.npc) ~= "table" then settings.npc = {} end
 			settings.npc.dances = enabled
 		end})
-	context.section:Slider({Text = "Trolly Volume", Min = 0, Max = 100,
+	context.section:Slider({Text = "Kotost Volume", Min = 0, Max = 100,
 		Default = type(context.defaults.npc) == "table" and tonumber(context.defaults.npc.volume) or 100,
 		Decimals = 0, Suffix = "%", Callback = function(value)
 			if type(settings.npc) ~= "table" then settings.npc = {} end
@@ -47502,6 +47809,7 @@ function KotostApplication.create(environment, parent, versions)
 	local nova = KotostUiFoundation.create(environment)
 	local layout = Layout.create()
 	local window, tabs = KotostWindow.create(environment, nova, layout, parent)
+	pcall(window.AttachSearch, window, translation)
 	environment.getgenv().__kotostMM2KotostUi = window
 	for _, group in ipairs(window.Groups) do translation.bind(group.Label, group.Key) end
 	for name, tab in pairs(tabs) do translation.bind(tab.Label, name) end
@@ -47550,6 +47858,12 @@ function KotostApplication.create(environment, parent, versions)
 	local stopFly = Movement.installFly({environment = environment, configuration = settings, defaults = defaults,
 		section = main, connect = connect, inputService = inputService, runService = runService,
 		workspace = workspace, player = players.LocalPlayer})
+	Movement.installEyeLasers({environment = environment, configuration = settings, defaults = defaults,
+		section = main, connect = connect, runService = runService, workspace = workspace,
+		player = players.LocalPlayer, players = players})
+	Movement.installDropKick({environment = environment, configuration = settings, defaults = defaults,
+		section = main, connect = connect, inputService = inputService, runService = runService,
+		workspace = workspace, player = players.LocalPlayer, players = players})
 	local stopSpin = Movement.installSpinAndBhop({environment = environment, configuration = settings, defaults = defaults,
 		section = main, connect = connect, runService = runService, workspace = workspace, player = players.LocalPlayer})
 	local stopInvisibility = Movement.installInvisibility({environment = environment, configuration = settings,
