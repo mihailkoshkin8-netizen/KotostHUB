@@ -1,5 +1,5 @@
--- Kotost Hub / 0.2 beta / complete v4 source + local cosmetic extensions
--- See KotostHub_README.txt for runtime limitations and media helper setup.
+-- Kotost Hub / 0.3 beta / complete source, local physical Lobby Changer
+-- See KotostHub_0.3_beta_README.txt for local/server limits and test notes.
 --[[
     kotost games hub - Murder Mystery 2
     intro -> menu, executor tests (Info tab), lock system (Requires = {"fn"} on Toggle/Button)
@@ -8670,7 +8670,7 @@ function TeleportFeature.install(context)
 		return nil
 	end
 	local function lobby()
-		local lobbyModel = workspace:FindFirstChild("RegularLobby") or workspace:FindFirstChild("Lobby")
+		local lobbyModel = workspace:FindFirstChild("Lobby") or workspace:FindFirstChild("RegularLobby")
 		local spawn
 		if lobbyModel then
 			local spawns = lobbyModel:FindFirstChild("Spawns")
@@ -19503,7 +19503,7 @@ function RoleFarm.who(context, roles, roleName)
 end
 
 function RoleFarm.lobby(context)
-	local lobby = context.workspace:FindFirstChild("RegularLobby") or context.workspace:FindFirstChild("Lobby")
+	local lobby = context.workspace:FindFirstChild("Lobby") or context.workspace:FindFirstChild("RegularLobby")
 	if not lobby then return nil end
 	local spawns = lobby:FindFirstChild("Spawns")
 	local spawn = spawns and spawns:FindFirstChildWhichIsA("BasePart") or lobby:FindFirstChildWhichIsA("SpawnLocation", true)
@@ -48319,8 +48319,8 @@ function KotostApplication.installInfo(context)
 	end
 end
 
--- 0.2 beta: local cosmetic extensions; no server remotes or automatic OS execution.
-local KotostBeta = {Version = "0.2 beta"}
+-- 0.3 beta: physical client-local lobby extensions; no server-spawn override or desktop helper.
+local KotostBeta = {Version = "0.3 beta"}
 KotostBeta.Releases = {
     {version = "0.1 beta", title = "Base build", notes = {
         "Existing hub: tabs, themes, configuration and executor capability panel.",
@@ -48335,6 +48335,16 @@ KotostBeta.Releases = {
         "Changelogs: one page per release and persistent seen flags.",
         "Sound Viewer: draggable media window and optional Windows media-session bridge.",
         "Vibe / Winter 2021: soft purple window lighting, gentle bloom and local snow."
+    }},
+    {version = "0.3 beta", title = "Physical local lobby", notes = {
+        "Removed Sound Viewer and all desktop-media helper generation/network polling.",
+        "Lobby Changer now detaches the original Lobby locally, including its collisions and spawn geometry.",
+        "The imported model becomes workspace.Lobby with its authored solid floors and walls preserved.",
+        "Placement now estimates floor height and floor center, rather than matching the lowest bounding-box point.",
+        "Spawn candidates are ground/headroom checked; blocked models roll back to the previous lobby.",
+        "Local lobby-spawn relocation after respawn; unrelated game-map spawns are left alone.",
+        "Restores the original lobby and local spawn preference when disabled. Server spawn authority is unchanged.",
+        "No fake Anti-Anti-Fling toggle: another client's protection cannot be disabled locally."
     }}
 }
 KotostBeta.Lobbies = {
@@ -48513,84 +48523,277 @@ function KotostBeta.changelog(ctx, ui)
     end)
 end
 
-function KotostBeta.lobby(ctx)
-    local s = {on = false, selected = "Default", serial = 0, saved = {}, original = nil, root = nil, busy = false, dead = false, offset = Vector3.zero}
-    local status, toggle
-    local function report(text) if status and status.Parent then status.Text = text end end
-    local function note(text) pcall(function() ctx.window:Notify({Title = "Lobby Changer", Text = text, Kind = "warning"}) end) end
-    local function restore()
-        local saved = s.saved; s.saved = {}
-        -- Restore immediately on disable, even while a native asset request is pending.
-        for object, props in pairs(saved) do
-            for property, entry in pairs(props) do pcall(function() if object[property] == entry.applied then object[property] = entry.before end end) end
+-- Physical local-lobby swap. The server's world and spawn selection remain authoritative.
+function KotostBeta.lobbyGeometry(root, valid)
+    local parts, markers, floors = {}, {}, {}
+    local function isMarker(part)
+        if part:IsA("SpawnLocation") then return true end
+        local name = string.lower(part.Name)
+        if name:find("spawn", 1, true) then return true end
+        local parent = part.Parent
+        while parent and parent ~= root do
+            if string.lower(parent.Name):find("spawn", 1, true) then return true end
+            parent = parent.Parent
         end
-        if s.originalConnection then s.originalConnection:Disconnect(); s.originalConnection = nil end
-        s.original = nil
+        return false
     end
-    local function setHidden(object)
-        local property, value
-        if object:IsA("BasePart") then property, value = "LocalTransparencyModifier", 1
-        elseif object:IsA("Decal") or object:IsA("Texture") then property, value = "Transparency", 1
-        elseif object:IsA("Light") or object:IsA("ParticleEmitter") or object:IsA("Beam") or object:IsA("Trail") or object:IsA("LayerCollector") then property, value = "Enabled", false end
-        if property then
-            pcall(function()
-                if not s.saved[object] then s.saved[object] = {} end
-                if not s.saved[object][property] then s.saved[object][property] = {before = object[property], applied = value} end
-                object[property] = value
-            end)
+    local ok, reason = KotostBeta.walk(root, function(object)
+        if object:IsA("BasePart") then
+            table.insert(parts, object)
+            if isMarker(object) and #markers < 64 then table.insert(markers, object) end
+            local size, cf = object.Size, object.CFrame
+            local name = string.lower(object.Name)
+            local flat = math.abs(cf.UpVector.Y) > 0.85 and math.min(size.X, size.Z) >= 4
+                and size.Y <= math.max(8, math.min(size.X, size.Z) * 0.18)
+            if flat and object.CanCollide and not name:find("roof", 1, true) and not name:find("ceiling", 1, true) then
+                local halfY = (math.abs(cf.RightVector.Y) * size.X + math.abs(cf.UpVector.Y) * size.Y + math.abs(cf.LookVector.Y) * size.Z) / 2
+                table.insert(floors, {part = object, y = object.Position.Y + halfY,
+                    area = math.min(size.X * size.Z, 1000000), named = name:find("floor", 1, true) or name:find("ground", 1, true)})
+            end
         end
+    end, valid, 30000)
+    if not ok then error(reason) end
+    assert(#parts > 0, "Lobby has no parts")
+    local cf, size
+    if root:IsA("Model") then cf, size = root:GetBoundingBox() else cf, size = root.CFrame, root.Size end
+    local pivot = root:GetPivot()
+    local direction = pivot.LookVector
+    local yaw = math.atan2(-direction.X, -direction.Z)
+    local function median(values)
+        table.sort(values); return values[math.floor((#values + 1) / 2)]
+    end
+    local floorY, center = nil, cf.Position
+    if #markers > 0 then
+        local ys, xs, zs = {}, {}, {}
+        for _, marker in ipairs(markers) do
+            table.insert(ys, marker.Position.Y - marker.Size.Y / 2)
+            table.insert(xs, marker.Position.X); table.insert(zs, marker.Position.Z)
+        end
+        local target = median(ys)
+        center = Vector3.new(median(xs), center.Y, median(zs))
+        -- Favor a walkable surface close beneath the central spawn group, not the bottom of a basement.
+        local best, score
+        for _, entry in ipairs(floors) do
+            local distance = (Vector3.new(entry.part.Position.X, 0, entry.part.Position.Z) - Vector3.new(center.X, 0, center.Z)).Magnitude
+            if entry.y <= target + 3 and entry.y >= target - 80 and distance < 1200 then
+                local value = math.abs(entry.y - target) + distance * 0.006 - math.log(math.max(entry.area, 1)) * 0.12
+                if not score or value < score then best, score = entry, value end
+            end
+        end
+        floorY = best and best.y or target
+    elseif #floors > 0 then
+        -- Dominant horizontal floor band; low-height/large-area plates outrank furniture.
+        local buckets = {}
+        for _, entry in ipairs(floors) do
+            local bucket = math.floor(entry.y / 2 + 0.5)
+            buckets[bucket] = (buckets[bucket] or 0) + entry.area * (entry.named and 2 or 1)
+        end
+        local band, score
+        for key, value in pairs(buckets) do if not score or value > score then band, score = key, value end end
+        local sum, total = 0, 0
+        for _, entry in ipairs(floors) do
+            if math.abs(entry.y - band * 2) < 2 then sum = sum + entry.y * entry.area; total = total + entry.area end
+        end
+        floorY = total > 0 and sum / total or band * 2
+    end
+    assert(floorY, "No recognizable floor or spawn markers; unsafe alignment cancelled")
+    local minX, minZ, maxX, maxZ, matched = math.huge, math.huge, -math.huge, -math.huge, 0
+    for _, entry in ipairs(floors) do
+        if math.abs(entry.y - floorY) <= 2.5 and entry.area >= 64 then
+            local p, dimensions, basis = entry.part.Position, entry.part.Size, entry.part.CFrame
+            local dx = (math.abs(basis.RightVector.X) * dimensions.X + math.abs(basis.LookVector.X) * dimensions.Z) / 2
+            local dz = (math.abs(basis.RightVector.Z) * dimensions.X + math.abs(basis.LookVector.Z) * dimensions.Z) / 2
+            minX, maxX = math.min(minX, p.X - dx), math.max(maxX, p.X + dx)
+            minZ, maxZ = math.min(minZ, p.Z - dz), math.max(maxZ, p.Z + dz)
+            matched = matched + 1
+        end
+    end
+    if matched > 0 then center = Vector3.new((minX + maxX) / 2, floorY, (minZ + maxZ) / 2)
+    else center = Vector3.new(center.X, floorY, center.Z) end
+    return {frame = CFrame.new(center) * CFrame.Angles(0, yaw, 0), floor = floorY, box = cf, size = size,
+        markers = markers, count = #parts}
+end
+
+function KotostBeta.lobbyContains(geometry, point)
+    if not geometry then return false end
+    local p = geometry.box:PointToObjectSpace(point)
+    return math.abs(p.X) <= math.min(geometry.size.X / 2 + 18, 1500)
+        and math.abs(p.Z) <= math.min(geometry.size.Z / 2 + 18, 1500)
+        and point.Y >= geometry.floor - 18
+        and point.Y <= math.max(geometry.floor + 65, geometry.box.Position.Y + geometry.size.Y / 2 + 5)
+end
+
+function KotostBeta.lobbySafeSpawn(root, geometry, character)
+    if not root or not root:IsDescendantOf(workspace) then return nil end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include; params.FilterDescendantsInstances = {root}
+    params.RespectCanCollide = true
+    local overlap = OverlapParams.new()
+    overlap.FilterType = Enum.RaycastFilterType.Include; overlap.FilterDescendantsInstances = {root}
+    overlap.MaxParts = 128
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    local clearance = math.max(3, humanoid and humanoid.HipHeight + (hrp and hrp.Size.Y / 2 or 1) or 3)
+    local function groundAt(point)
+        local result = workspace:Raycast(point + Vector3.new(0, 2, 0), Vector3.new(0, -90, 0), params)
+        if not result or result.Normal.Y < 0.7 or result.Position.Y < geometry.floor - 15
+            or result.Position.Y > geometry.floor + 16 then return nil end
+        local ceiling = workspace:Raycast(result.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, math.max(5, clearance + 2), 0), params)
+        if ceiling then return nil end
+        local standing = result.Position + Vector3.new(0, clearance + 0.3, 0)
+        -- Reject blocked/head-clipping spawn points instead of teleporting into a wall.
+        local box = CFrame.new(result.Position + Vector3.new(0, 2.9, 0))
+        local blockers = workspace:GetPartBoundsInBox(box, Vector3.new(2.4, 4.8, 2.4), overlap)
+        if #blockers >= 128 then return nil end
+        for _, part in ipairs(blockers) do
+            if part.CanCollide and part ~= result.Instance then return nil end
+        end
+        local _, yaw = geometry.frame:ToOrientation()
+        return CFrame.new(standing) * CFrame.Angles(0, yaw, 0)
+    end
+    local ranked = {}
+    for _, marker in ipairs(geometry.markers) do
+        if marker:IsDescendantOf(root) then
+            table.insert(ranked, {part = marker, distance = (marker.Position - geometry.frame.Position).Magnitude})
+        end
+    end
+    table.sort(ranked, function(a, b) return a.distance < b.distance end)
+    for i = 1, math.min(#ranked, 24) do
+        local marker = ranked[i].part
+        local found = groundAt(marker.Position + Vector3.new(0, marker.Size.Y / 2, 0))
+        if found then return found, marker:IsA("SpawnLocation") and marker or nil end
+    end
+    -- A model without usable spawn markers gets a validated floor fallback, never an arbitrary world origin.
+    for _, offset in ipairs({Vector3.zero, Vector3.new(8, 0, 0), Vector3.new(-8, 0, 0), Vector3.new(0, 0, 8),
+        Vector3.new(0, 0, -8), Vector3.new(20, 0, 20), Vector3.new(-20, 0, -20), Vector3.new(40, 0, 0)}) do
+        local point = geometry.frame:PointToWorldSpace(offset) + Vector3.new(0, 10, 0)
+        local found = groundAt(point)
+        if found then return found, nil end
+    end
+    return nil
+end
+
+function KotostBeta.lobby(ctx)
+    local s = {on = false, dead = false, busy = false, selected = "Default", serial = 0,
+        offset = Vector3.zero, original = nil, originalParent = nil, originalGeometry = nil,
+        root = nil, geometry = nil, staging = nil, swapping = false, generatedSpawns = {}}
+    local player = game:GetService("Players").LocalPlayer
+    local toggle, status, originalDestroying
+    local function report(text) if status and status.Parent then status.Text = text end end
+    local function notify(text) pcall(function() ctx.window:Notify({Title = "Lobby Changer", Text = text, Kind = "warning"}) end) end
+    local function characterLocation()
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        return character, root, root and root.Position
     end
     local function originalLobby()
-        local object = workspace:FindFirstChild("Lobby")
-        if not object or (not object:IsA("Model") and not object:IsA("BasePart")) then error("workspace.Lobby must be a Model or BasePart") end
-        return object
+        if s.original then return s.original end
+        local lobby = workspace:FindFirstChild("Lobby")
+        assert(lobby and lobby ~= s.root and (lobby:IsA("Model") or lobby:IsA("BasePart")), "workspace.Lobby is not ready")
+        return lobby
     end
-    local function bounds(object)
-        if object:IsA("Model") then return object:GetBoundingBox() end
-        return object.CFrame, object.Size
-    end
-    local function hideOriginal(original, valid)
-        if s.original == original then return true end
-        restore(); s.original = original
-        s.originalConnection = ctx.connect(original.DescendantAdded, function(object)
-            if s.on and not s.dead and s.original == original then setHidden(object) end
+    local function warp(character, destination)
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root or not humanoid or humanoid.Health <= 0 or not destination then return false end
+        local ok = pcall(function()
+            character:PivotTo(destination * root.CFrame:Inverse() * character:GetPivot())
+            root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
         end)
-        return KotostBeta.walk(original, setHidden, valid)
+        return ok
+    end
+    local function localSpawn(root, geometry, character)
+        local destination, spawn = KotostBeta.lobbySafeSpawn(root, geometry, character)
+        if destination and not spawn and root == s.root then
+            -- A local-only SpawnLocation also makes the replacement discoverable to this hub's lobby helpers.
+            local object = Instance.new("SpawnLocation")
+            object.Name = "KotostValidatedSpawn"; object.Size = Vector3.new(4, 0.2, 4)
+            object.Anchored = true; object.CanCollide = false; object.CanTouch = false; object.CanQuery = false
+            object.Transparency = 1; object.Neutral = true; object.Enabled = true
+            object.CFrame = CFrame.new(destination.Position - Vector3.new(0, 3.2, 0))
+            object:SetAttribute("KotostLocalSpawn", true); object.Parent = root
+            table.insert(s.generatedSpawns, object); table.insert(geometry.markers, object)
+            spawn = object
+        end
+        return destination, spawn
+    end
+    local function setRespawn(spawn)
+        if not spawn then return end
+        if not s.respawnCaptured then
+            s.respawnCaptured = true
+            local ok, value = pcall(function() return player.RespawnLocation end)
+            if ok then s.respawnOriginal = value end
+        end
+        local ok = pcall(function() player.RespawnLocation = spawn end)
+        if ok then s.respawnWritten = spawn end -- This is a local hint, not a server spawn override.
+    end
+    local function restoreRespawn()
+        if s.respawnCaptured then
+            pcall(function() if player.RespawnLocation == s.respawnWritten then player.RespawnLocation = s.respawnOriginal end end)
+        end
+        s.respawnCaptured, s.respawnOriginal, s.respawnWritten = false, nil, nil
+    end
+    local function restore(moveCharacter)
+        local character, _, position = characterLocation()
+        local move = moveCharacter and position and KotostBeta.lobbyContains(s.geometry, position)
+        s.swapping = true
+        local replacement = s.root; s.root, s.geometry = nil, nil
+        if replacement then pcall(function() replacement.Parent = nil end) end
+        restoreRespawn()
+        if originalDestroying then originalDestroying:Disconnect(); originalDestroying = nil end
+        local original, geometry, parent = s.original, s.originalGeometry, s.originalParent
+        local restored = false
+        if original then
+            local ok = pcall(function()
+                -- Never create a second Lobby if the server already delivered a replacement.
+                local current = workspace:FindFirstChild("Lobby")
+                if current and current ~= original then return end
+                original.Parent = parent or workspace; restored = true
+            end)
+            restored = restored and ok
+        end
+        s.original, s.originalParent, s.originalGeometry = nil, nil, nil
+        s.generatedSpawns = {}; s.swapping = false
+        KotostBeta.retire(replacement)
+        if move and restored and geometry then
+            local destination = KotostBeta.lobbySafeSpawn(original, geometry, character)
+            if destination then warp(character, destination) end
+        end
+        return restored
     end
     local function load(id, valid)
         local loaded
-        local ok, err = pcall(function() loaded = game:GetObjects("rbxassetid://" .. tostring(id)) end)
-        if not ok or type(loaded) ~= "table" or #loaded == 0 then error("Asset unavailable or blocked: " .. tostring(err)) end
-        local root = Instance.new("Model"); root.Name = "KotostLocalLobby"
-        for _, object in ipairs(loaded) do object.Parent = root end
+        local ok, message = pcall(function() loaded = game:GetObjects("rbxassetid://" .. tostring(id)) end)
+        assert(ok and type(loaded) == "table" and #loaded > 0, "Asset is unavailable: " .. tostring(message))
+        local root = Instance.new("Model"); root.Name = "KotostLobbyStaging"
         s.staging = root
-        local parts = 0
-        local traversed, reason = KotostBeta.walk(root, function(object)
-            -- Imported code is never moved into Workspace, including ModuleScripts.
+        for _, object in ipairs(loaded) do object.Parent = root end
+        local count = 0
+        local walked, reason = KotostBeta.walk(root, function(object)
             if object:IsA("LuaSourceContainer") or object:IsA("RemoteEvent") or object:IsA("RemoteFunction")
                 or object:IsA("ProximityPrompt") or object:IsA("ClickDetector") or object:IsA("Sound")
-                or object:IsA("Humanoid") or object:IsA("JointInstance") or object:IsA("Constraint") then
+                or object:IsA("Humanoid") or object:IsA("JointInstance") or object:IsA("Constraint") or object:IsA("Tool") then
                 object:Destroy(); return false
             end
             if object:IsA("BasePart") then
-                parts += 1; object.Anchored = true; object.CanCollide = false; object.CanTouch = false; object.CanQuery = false
+                count = count + 1; object.Anchored = true; object.CanTouch = false
+                -- Retain authored solid walls/floors and non-solid decoration; don't turn all meshes into blocks.
+                object.CanQuery = object.CanCollide
+                if object.CanCollide then pcall(function() object.CollisionGroup = "Default" end) end
+                if object:IsA("SpawnLocation") then object.Enabled = true; object.Neutral = true; object.Duration = 0 end
             end
             if object:IsA("Light") then object.Shadows = false end
             if object:IsA("ParticleEmitter") then object.Rate = math.min(object.Rate, 18) end
             if object:IsA("LayerCollector") then object.Enabled = false end
         end, valid, 24000)
-        if not traversed then error(reason) end
-        if parts == 0 then error("Asset contains no renderable parts") end
+        assert(walked, reason); assert(count > 0, "Model has no geometry")
         return root
     end
-    local function requestChange()
-        s.serial += 1
-        if not s.on then
-            restore()
-            local old = s.root; s.root = nil; KotostBeta.retire(old)
-            report("Original lobby restored")
-        end
-        if s.busy or s.dead then return end
+    local requestChange
+    requestChange = function()
+        s.serial = s.serial + 1
+        if not s.on then restore(true); report("Original lobby restored · local swap off") end
+        if s.dead or s.busy then return end
         s.busy = true
         task.spawn(function()
             local observed = -1
@@ -48599,33 +48802,66 @@ function KotostBeta.lobby(ctx)
                 local epoch, selected = observed, s.selected
                 local function valid() return not s.dead and s.on and epoch == s.serial and not ctx.window.Destroyed end
                 if s.on then
-                    report("Loading " .. selected .. "… original remains visible until ready")
-                    local ok, err = xpcall(function()
+                    report("Preparing " .. selected .. " · current lobby retained until ready")
+                    local ok, message = xpcall(function()
                         local original = originalLobby()
-                        local spec; for _, option in ipairs(KotostBeta.Lobbies) do if option.code == selected then spec = option end end
-                        assert(spec, "Unknown lobby")
+                        local originalGeometry = s.originalGeometry or KotostBeta.lobbyGeometry(original, valid)
+                        local spec
+                        for _, option in ipairs(KotostBeta.Lobbies) do if option.code == selected then spec = option end end
+                        assert(spec, "Unknown lobby preset")
                         local candidate = load(spec.id, valid)
-                        if not valid() then error("cancelled") end
-                        local target, targetSize = bounds(original)
-                        local current, size = bounds(candidate)
-                        -- Align horizontal centers, original rotation and bounding-box floor height.
-                        -- Deliberately do not scale different seasonal maps to the same size.
-                        local desired = target * CFrame.new(s.offset + Vector3.new(0, (size.Y - targetSize.Y) / 2, 0))
-                        candidate:PivotTo(desired * current:Inverse() * candidate:GetPivot())
-                        if not valid() or workspace:FindFirstChild("Lobby") ~= original then error("Lobby changed while loading; retry") end
-                        if not hideOriginal(original, valid) then error("cancelled") end
-                        if not valid() then error("cancelled") end
-                        local previous = s.root
-                        candidate.Parent = workspace; s.root, s.staging = candidate, nil
+                        local geometry = KotostBeta.lobbyGeometry(candidate, valid)
+                        local desired = originalGeometry.frame * CFrame.new(s.offset)
+                        candidate:PivotTo(desired * geometry.frame:Inverse() * candidate:GetPivot())
+                        geometry = KotostBeta.lobbyGeometry(candidate, valid)
+                        assert(valid(), "cancelled")
+                        local current = workspace:FindFirstChild("Lobby")
+                        assert(current == (s.root or original), "Server lobby changed during loading; retry")
+                        local character, _, position = characterLocation()
+                        local move = position and (KotostBeta.lobbyContains(s.geometry, position) or KotostBeta.lobbyContains(originalGeometry, position))
+                        local previous, previousGeometry = s.root, s.geometry
+                        local first = not s.original
+                        if first then
+                            s.original, s.originalParent, s.originalGeometry = original, original.Parent, originalGeometry
+                            originalDestroying = ctx.connect(original.Destroying, function()
+                                -- The server may destroy the original even while it is detached on this client.
+                                if s.original == original then
+                                    s.original = nil; s.originalGeometry = nil
+                                    task.defer(function() if s.on then s.on = false; if toggle then toggle.SetSilent(false) end; requestChange(); notify("Server removed the saved lobby; waiting for its new lobby.") end end)
+                                end
+                            end)
+                        end
+                        -- Commit contains no yields: there is no simulation frame without either lobby.
+                        s.swapping = true
+                        original.Parent = nil
+                        if previous then previous.Parent = nil end
+                        candidate.Name = "Lobby"; s.root, s.geometry = candidate, geometry
+                        local committed, commitError = pcall(function()
+                            candidate.Parent = workspace
+                            local destination, spawn = localSpawn(candidate, geometry, character)
+                            assert(destination, "No clear, walkable spawn found; keeping previous lobby")
+                            setRespawn(spawn)
+                            if move then warp(character, destination) end
+                        end)
+                        if not committed then
+                            candidate.Parent = nil; s.root, s.geometry = previous, previousGeometry
+                            if previous then previous.Parent = workspace
+                            else original.Parent = s.originalParent; s.original, s.originalParent, s.originalGeometry = nil, nil, nil
+                                if originalDestroying then originalDestroying:Disconnect(); originalDestroying = nil end
+                            end
+                            s.swapping = false
+                            error(commitError)
+                        end
+                        s.staging = nil; s.swapping = false
                         KotostBeta.retire(previous)
-                        report(selected .. " · local appearance only; original collision retained")
-                    end, function(message) return tostring(message) end)
+                        report(selected .. " · physical local lobby · original detached")
+                    end, function(err) return tostring(err) end)
+                    s.swapping = false
                     if s.staging then local stale = s.staging; s.staging = nil; KotostBeta.retire(stale) end
-                    if not ok and not s.root then restore() end
                     if not ok and valid() then
-                        if not s.root then restore(); s.on = false; if toggle then toggle.SetSilent(false) end end
-                        report("Not changed: " .. tostring(err)); note(tostring(err))
-                    elseif not s.on then restore() end
+                        if not s.root then s.on = false; restore(false); if toggle then toggle.SetSilent(false) end end
+                        report("Not changed: " .. tostring(message)); notify(tostring(message))
+                    end
                 end
             end
             s.busy = false
@@ -48643,33 +48879,56 @@ function KotostBeta.lobby(ctx)
                     local old = s.offset
                     local updated = Vector3.new(component == 1 and value or old.X, component == 2 and value or old.Y, component == 3 and value or old.Z)
                     s.offset = updated
-                    if s.root and s.original then
-                        pcall(function()
-                            local rotation = s.original:IsA("Model") and select(1, s.original:GetBoundingBox()) or s.original.CFrame
-                            local delta = rotation:VectorToWorldSpace(updated - old)
-                            s.root:PivotTo(s.root:GetPivot() + delta)
-                        end)
-                    end
+                    if s.on and s.root and s.originalGeometry then requestChange() end
                 end})
         end
-        section:Note({Text = "Cosmetic only: original collision stays. Loading depends on asset permissions."})
+        section:Note({Text = "Local physics + spawn relocation. Server spawn authority is unchanged. Original is kept detached for restore."})
     end, Callback = function(on) s.on = on; requestChange() end})
     status = section:Note({Text = "Original lobby · disabled"})
-    -- Reapply only when the actual server lobby instance changes, not every frame.
+    ctx.connect(player.CharacterAdded, function(character)
+        local epoch = s.serial
+        task.spawn(function()
+            task.wait(0.6)
+            -- Bounded correction after a genuine lobby spawn, never a permanent teleport loop.
+            for _ = 1, 20 do
+                if not s.on or s.dead or epoch ~= s.serial or character ~= player.Character then return end
+                local hrp = character:FindFirstChild("HumanoidRootPart")
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and humanoid.Health > 0 and s.root and s.geometry then
+                    if KotostBeta.lobbyContains(s.originalGeometry, hrp.Position) then
+                        local destination, spawn = localSpawn(s.root, s.geometry, character)
+                        if destination then setRespawn(spawn); warp(character, destination); return end
+                    elseif hrp.Position.Magnitude > 5 then
+                        -- An appearance on an unrelated map is not redirected to the lobby.
+                        return
+                    end
+                end
+                task.wait(0.15)
+            end
+        end)
+    end)
     ctx.connect(workspace.ChildAdded, function(object)
-        if object.Name == "Lobby" and s.on then requestChange() end
+        if s.swapping or not s.on or object == s.root or object.Name ~= "Lobby" then return end
+        task.defer(function()
+            if not s.on or object == s.root then return end
+            -- A server lobby replacement supersedes our parked reference. Stop rather than duplicate server geometry.
+            s.on = false; if toggle then toggle.SetSilent(false) end
+            requestChange(); notify("Server delivered a new Lobby. Local replacement was disabled; enable again when ready.")
+        end)
     end)
     ctx.connect(workspace.ChildRemoved, function(object)
-        if object == s.original then
-            restore(); local old = s.root; s.root = nil; KotostBeta.retire(old)
-            if s.on then s.serial += 1; report("Waiting for workspace.Lobby…") end
-        end
+        if s.swapping or object ~= s.root or not s.on then return end
+        task.defer(function()
+            if s.on and s.root == object and object.Parent ~= workspace then
+                s.on = false; if toggle then toggle.SetSilent(false) end; requestChange()
+            end
+        end)
     end)
     return function()
-        s.dead, s.on = true, false; s.serial += 1; restore()
-        local old = s.root; s.root = nil; KotostBeta.retire(old)
+        s.dead, s.on = true, false; s.serial = s.serial + 1; restore(true)
     end
 end
+
 
 function KotostBeta.vibe(ctx)
     local s = {on = false, epoch = 0, owned = {}, lights = {}, lightParts = {}, saved = {}, effects = {}}
@@ -48769,154 +49028,6 @@ function KotostBeta.vibe(ctx)
     return function() stop(); ctx.visualWorld.context.betaVibeApply = previousApply; ctx.visualWorld.context.betaVibeBefore = previousBefore end
 end
 
-function KotostBeta.sound(ctx, ui)
-    local host, http = ctx.host, game:GetService("HttpService")
-    local state = {on = false, epoch = 0, busy = false, data = {}, commandBusy = false, artRevision = nil}
-    local token, request, panel, toggle, title, artist, source, elapsed, fill, play, nextButton, prevButton, artwork, rail
-    local setupWarning = false
-    local function setup()
-        request = host.request or host.http_request or (host.syn and host.syn.request) or (host.http and host.http.request)
-        assert(type(request) == "function", "HTTP requests are unavailable in this executor")
-        assert(type(host.writefile) == "function" and type(host.readfile) == "function", "Real file read/write access is required")
-        if host.makefolder then pcall(host.makefolder, "KotostHub") end
-        local ok, value = pcall(host.readfile, "KotostHub/media_token.txt")
-        token = ok and type(value) == "string" and value:match("^%s*([%w%-]+)%s*$") or nil
-        if not token or #token < 24 then token = http:GenerateGUID(false) .. http:GenerateGUID(false); host.writefile("KotostHub/media_token.txt", token) end
-        -- Source is written for explicit, manual execution only. Never shell/execute it.
-        host.writefile("KotostHub/media_bridge.py", KotostBeta.MediaBridgeSource)
-        host.writefile("KotostHub/MEDIA_README.txt", "Windows 10/11 only. Run this helper manually, without administrator rights.\nInstall Python dependencies:\npy -m pip install winrt-runtime winrt-Windows.Foundation winrt-Windows.Media winrt-Windows.Media.Control winrt-Windows.Storage.Streams\nThen open a terminal in this folder and run: py media_bridge.py\nOr use: py media_bridge.py --folder C:\\path\\to\\workspace\\KotostHub\nOnly apps exposing Windows media sessions are supported. Browser playback may need media keys integration. Not every app permits seeking/skipping. Android/iOS are not supported by this bridge.\nOnly loopback 127.0.0.1:17841, token authenticated. No cloud uploads or automatic execution. Close the helper window to stop.\n")
-    end
-    local function call(path, data)
-        local response = request({Url = "http://127.0.0.1:17841" .. path, Method = data and "POST" or "GET",
-            Headers = {Authorization = "Bearer " .. token, ["Content-Type"] = "application/json"},
-            Body = data and http:JSONEncode(data) or nil, Timeout = 3})
-        assert(type(response) == "table" and tonumber(response.StatusCode) == 200, "Bridge unavailable or authorization failed")
-        return response.Body
-    end
-    local function clock(value)
-        value = math.max(0, math.floor(tonumber(value) or 0))
-        return string.format("%d:%02d", math.floor(value / 60), value % 60)
-    end
-    local function command(action, position)
-        if state.commandBusy or not state.on or not state.data.available then return end
-        local flag = ({toggle = "can_toggle", next = "can_next", previous = "can_previous", seek = "can_seek"})[action]
-        if flag and not state.data[flag] then return end
-        state.commandBusy = true
-        task.spawn(function()
-            local ok, result = pcall(function() return http:JSONDecode(call("/command", {action = action, position = position})) end)
-            if panel and panel.Parent and state.on and (not ok or type(result) ~= "table" or not result.ok) then
-                source.Text = ok and type(result) == "table" and tostring(result.error or "Command declined") or "Bridge command failed"
-            end
-            state.commandBusy = false
-        end)
-    end
-    local dragging, dragFraction = false, 0
-    local function build()
-        panel = ui.panel("KotostSoundViewer", 440, 270)
-        ui.text(panel, "SOUND VIEWER", 20, 17, 300, 27, "Text", 18)
-        ui.button(panel, "×", 380, 10, 44, function() if toggle then toggle.Set(false) end end)
-        artwork = ui.make("ImageLabel", {Position = UDim2.fromOffset(20, 71), Size = UDim2.fromOffset(72, 72),
-            Image = "", BorderSizePixel = 0, ZIndex = 12, ScaleType = Enum.ScaleType.Crop}, panel, "Surface2")
-        ctx.nova.U.corner(artwork, 8)
-        title = ui.text(panel, "Waiting for media bridge…", 108, 72, -128, 28, "Text", 16)
-        title.TextTruncate = Enum.TextTruncate.AtEnd
-        artist = ui.text(panel, "", 108, 103, -128, 20, "Muted", 14); artist.TextTruncate = Enum.TextTruncate.AtEnd
-        source = ui.text(panel, "Run KotostHub/media_bridge.py manually", 20, 148, -40, 20, "Muted", 12)
-        source.TextTruncate = Enum.TextTruncate.AtEnd
-        rail = ui.make("TextButton", {Text = "", Position = UDim2.fromOffset(20, 176), Size = UDim2.new(1, -40, 0, 22),
-            BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 14, Active = true}, panel)
-        local track = ui.make("Frame", {Position = UDim2.new(0, 0, 0.5, -2), Size = UDim2.new(1, 0, 0, 4), BorderSizePixel = 0, ZIndex = 12}, rail, "Elevated")
-        ctx.nova.U.corner(track, 2)
-        fill = ui.make("Frame", {Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, ZIndex = 13}, track, "Accent")
-        ctx.nova.U.corner(fill, 2)
-        elapsed = ui.text(panel, "0:00 / 0:00", 20, 214, 100, 24, "Muted", 12)
-        prevButton = ui.button(panel, "|‹", 142, 207, 52, function() command("previous") end)
-        play = ui.button(panel, "Play", 202, 207, 80, function() command("toggle") end)
-        nextButton = ui.button(panel, "›|", 290, 207, 52, function() command("next") end)
-        local activeTouch
-        local function setPosition(x)
-            dragFraction = math.clamp((x - rail.AbsolutePosition.X) / math.max(1, rail.AbsoluteSize.X), 0, 1)
-            fill.Size = UDim2.fromScale(dragFraction, 1)
-            elapsed.Text = clock(dragFraction * (state.data.duration or 0)) .. " / " .. clock(state.data.duration)
-        end
-        ctx.connect(rail.InputBegan, function(input)
-            if state.data.can_seek and (state.data.duration or 0) > 0 and
-                (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
-                dragging = true; activeTouch = input.UserInputType == Enum.UserInputType.Touch and input or nil; setPosition(input.Position.X)
-            end
-        end)
-        ctx.connect(ctx.input.InputChanged, function(input)
-            if dragging and (input == activeTouch or (not activeTouch and input.UserInputType == Enum.UserInputType.MouseMovement)) then setPosition(input.Position.X) end
-        end)
-        ctx.connect(ctx.input.InputEnded, function(input)
-            if dragging and (input == activeTouch or input.UserInputType == Enum.UserInputType.MouseButton1) then
-                dragging = false; command("seek", dragFraction * (state.data.duration or 0)); activeTouch = nil
-            end
-        end)
-    end
-    local function activate(on)
-        state.on = on; state.epoch += 1; local epoch = state.epoch
-        if not on then if panel then panel.Visible = false end; return end
-        if not panel then build() end; panel.Visible = true
-        local ok, err = pcall(setup)
-        if not ok then source.Text = tostring(err); state.on = false; task.defer(function() if toggle then toggle.SetSilent(false) end end); return end
-        if not setupWarning then
-            setupWarning = true
-            ctx.window:Notify({Title = "Sound Viewer", Text = "Helper saved in KotostHub. Run media_bridge.py manually on Windows. See MEDIA_README.txt.", Kind = "info"})
-        end
-        task.spawn(function()
-            while state.on and epoch == state.epoch and not ctx.window.Destroyed do
-                if not state.busy then
-                    state.busy = true
-                    local okState, data = pcall(function() return http:JSONDecode(call("/state")) end)
-                    if epoch == state.epoch and state.on then
-                        if okState and type(data) == "table" then
-                            state.data = data
-                            title.Text = data.available and tostring(data.title) or "No active media session"
-                            artist.Text = data.available and tostring(data.artist or "") or "Start playback in a supported app"
-                            source.Text = data.error or data.source or "Windows media sessions · connected"
-                            play.Text = data.playing and "Pause" or "Play"
-                            for _, entry in ipairs({{play, data.can_toggle}, {nextButton, data.can_next}, {prevButton, data.can_previous}}) do
-                                entry[1].Active = entry[2] == true; entry[1].TextTransparency = entry[2] and 0 or 0.6
-                            end
-                            if not dragging then
-                                fill.Size = UDim2.fromScale((data.duration or 0) > 0 and math.clamp((data.position or 0) / data.duration, 0, 1) or 0, 1)
-                                elapsed.Text = clock(data.position) .. " / " .. clock(data.duration)
-                            end
-                            if not data.has_artwork then artwork.Image = ""; state.artRevision = nil
-                            elseif data.artwork_revision ~= state.artRevision and type(host.getcustomasset or host.getsynasset) == "function" then
-                                local okArt = pcall(function()
-                                    local bytes = call("/artwork"); assert(#bytes <= 4 * 1024 * 1024)
-                                    local extension = tostring(data.artwork_mime):find("jpeg", 1, true) and ".jpg" or ".png"
-                                    local revision = data.artwork_revision
-                                    local path = "KotostHub/media_cover_" .. tostring(revision) .. extension
-                                    host.writefile(path, bytes)
-                                    local asset = (host.getcustomasset or host.getsynasset)(path)
-                                    if epoch == state.epoch and state.on then artwork.Image = asset; state.artRevision = revision end
-                                    -- Keep at most the most recent two disk covers, avoiding texture-cache reuse.
-                                    if state.oldCover and host.delfile then pcall(host.delfile, state.oldCover) end
-                                    state.oldCover = state.cover; state.cover = path
-                                end)
-                                if not okArt then artwork.Image = "" end
-                            end
-                        else
-                            state.data = {}; title.Text = "Bridge disconnected"; artist.Text = "Run media_bridge.py on Windows"
-                            source.Text = "No access to external music without the helper"; artwork.Image = ""
-                            state.artRevision = nil; fill.Size = UDim2.fromScale(0, 1)
-                        end
-                    end
-                    state.busy = false
-                end
-                task.wait(0.65)
-            end
-        end)
-    end
-    ctx.general:Sub("UI"); ctx.general:Group({Title = "Desktop media"})
-    toggle = ctx.general:Toggle({Text = "Sound Viewer", Default = false, NoSave = true, Callback = activate})
-    ctx.general:Note({Text = "Windows helper required. Only apps publishing system media sessions; no universal browser/audio capture."})
-    return function() activate(false) end
-end
-
 function KotostBeta.install(ctx)
     local ui = KotostBeta.ui(ctx)
     local stops = {}
@@ -48924,184 +49035,16 @@ function KotostBeta.install(ctx)
     ctx.betaStops = stops
     for _, entry in ipairs({{"Lobby Changer", function() return KotostBeta.lobby(ctx) end},
         {"Vibe", function() return KotostBeta.vibe(ctx) end},
-        {"Sound Viewer", function() return KotostBeta.sound(ctx, ui) end},
         {"Changelogs", function() KotostBeta.changelog(ctx, ui) end}}) do
         local ok, cleanup = pcall(entry[2])
         if ok and type(cleanup) == "function" then table.insert(stops, cleanup)
-        elseif not ok then warn("[Kotost 0.2] " .. entry[1] .. ": " .. tostring(cleanup)) end
+        elseif not ok then warn("[Kotost 0.3] " .. entry[1] .. ": " .. tostring(cleanup)) end
     end
     return function() for i = #stops, 1, -1 do pcall(stops[i]) end end
 end
 
-KotostBeta.MediaBridgeSource = [=====["""Kotost Sound Viewer bridge. Windows 10/11; run manually, not as administrator.
-Install: py -m pip install winrt-runtime winrt-Windows.Foundation winrt-Windows.Media winrt-Windows.Media.Control winrt-Windows.Storage.Streams
-Run: py media_bridge.py --folder "C:\\path\\to\\executor\\workspace\\KotostHub"
-Only applications publishing Windows media sessions can be read/controlled.
-"""
-import argparse
-import asyncio
-import json
-import secrets
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import urlsplit
+-- Desktop-media helper removed in 0.3 beta. No helper is generated or contacted.
 
-async def main():
-    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as Manager
-    from winrt.windows.storage.streams import DataReader
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--folder', type=Path, default=Path(__file__).resolve().parent)
-    args = parser.parse_args()
-    folder = args.folder.resolve()
-    token_path = folder / 'media_token.txt'
-    if not token_path.is_file():
-        raise SystemExit('Run Kotost Hub and enable Sound Viewer first: media_token.txt is missing.')
-    token = token_path.read_text(encoding='utf-8').strip()
-    if len(token) < 24:
-        raise SystemExit('Invalid media_token.txt; regenerate it in the hub.')
-    manager = await Manager.request_async()
-    loop = asyncio.get_running_loop()
-    state = {'connected': True, 'available': False}
-    art = b''
-    art_type = 'image/png'
-    art_key = None
-    revision = 0
-    active = None
-    lock = threading.Lock()
-    async def command(data):
-        session = manager.get_current_session()
-        if not session:
-            return {'ok': False, 'error': 'No active media session'}
-        action = data.get('action')
-        if action == 'toggle':
-            ok = await session.try_toggle_play_pause_async()
-        elif action == 'next':
-            ok = await session.try_skip_next_async()
-        elif action == 'previous':
-            ok = await session.try_skip_previous_async()
-        elif action == 'seek':
-            timeline = session.get_timeline_properties()
-            duration = (timeline.end_time - timeline.start_time).total_seconds()
-            position = float(data.get('position', 0))
-            if not 0 <= position <= max(0, duration):
-                return {'ok': False, 'error': 'Seek outside track range'}
-            ticks = int((timeline.start_time.total_seconds() + position) * 10_000_000)
-            ok = await session.try_change_playback_position_async(ticks)
-        else:
-            return {'ok': False, 'error': 'Unsupported command'}
-        return {'ok': bool(ok), 'error': '' if ok else 'Application declined this command'}
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-        def authorized(self):
-            if self.headers.get('Origin'):
-                return False
-            if self.headers.get('Host', '') not in ('127.0.0.1:17841', 'localhost:17841'):
-                return False
-            return secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token)
-        def reply(self, value, status=200, mime='application/json'):
-            body = value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False).encode('utf-8')
-            self.send_response(status)
-            self.send_header('Content-Type', mime)
-            self.send_header('Content-Length', str(len(body)))
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            self.wfile.write(body)
-        def do_GET(self):
-            if not self.authorized():
-                return self.reply({'error': 'Unauthorized'}, 403)
-            path = urlsplit(self.path).path
-            with lock:
-                snapshot, image, mime = dict(state), art, art_type
-            if path == '/state':
-                self.reply(snapshot)
-            elif path == '/artwork':
-                self.reply(image, 200 if image else 404, mime)
-            else:
-                self.reply({'error': 'Not found'}, 404)
-        def do_POST(self):
-            if not self.authorized():
-                return self.reply({'error': 'Unauthorized'}, 403)
-            if self.path != '/command':
-                return self.reply({'error': 'Not found'}, 404)
-            try:
-                size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 2048:
-                    return self.reply({'error': 'Invalid body size'}, 400)
-                data = json.loads(self.rfile.read(size))
-                if not isinstance(data, dict):
-                    return self.reply({'error': 'Expected object'}, 400)
-                future = asyncio.run_coroutine_threadsafe(command(data), loop)
-                self.reply(future.result(timeout=5))
-            except Exception as exc:
-                self.reply({'ok': False, 'error': str(exc)[:250]}, 400)
-    server = ThreadingHTTPServer(('127.0.0.1', 17841), Handler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print('Kotost media bridge listening on 127.0.0.1:17841. Close this window or press Ctrl+C to stop.')
-    try:
-        while True:
-            snapshot = {'connected': True, 'available': False, 'timestamp': time.time()}
-            try:
-                session = manager.get_current_session()
-                if session:
-                    props = await session.try_get_media_properties_async()
-                    playback = session.get_playback_info()
-                    timeline = session.get_timeline_properties()
-                    controls = playback.controls
-                    identity = (session.source_app_user_model_id, props.title, props.artist, props.album_title)
-                    if identity != art_key:
-                        image, mime = b'', 'image/png'
-                        if props.thumbnail:
-                            stream = await props.thumbnail.open_read_async()
-                            try:
-                                if 0 < stream.size <= 4 * 1024 * 1024:
-                                    reader = DataReader(stream)
-                                    try:
-                                        size = await reader.load_async(int(stream.size))
-                                        buf = bytearray(size)
-                                        reader.read_bytes(buf)
-                                        image = bytes(buf)
-                                        mime = stream.content_type or 'image/png'
-                                    finally:
-                                        reader.detach_stream()
-                                        reader.close()
-                            finally:
-                                stream.close()
-                        with lock:
-                            art, art_type = image, mime
-                            revision += 1
-                        art_key, active = identity, session
-                    snapshot.update(available=True, title=props.title or 'Untitled', artist=props.artist or '',
-                        source=session.source_app_user_model_id,
-                        playing=int(playback.playback_status) == 4,
-                        position=max(0, (timeline.position - timeline.start_time).total_seconds()),
-                        duration=max(0, (timeline.end_time - timeline.start_time).total_seconds()),
-                        can_toggle=bool(controls.is_play_pause_toggle_enabled),
-                        can_next=bool(controls.is_next_enabled), can_previous=bool(controls.is_previous_enabled),
-                        can_seek=bool(controls.is_playback_position_enabled),
-                        artwork_revision=revision, artwork_mime=art_type, has_artwork=bool(art))
-                else:
-                    art_key, active = None, None
-                    with lock:
-                        art = b''
-            except Exception as exc:
-                snapshot['error'] = str(exc)[:250]
-            with lock:
-                state = snapshot
-            await asyncio.sleep(0.5)
-    finally:
-        server.shutdown()
-        server.server_close()
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-]=====]
 
 function KotostApplication.start(host, game, parent)
 	local environment, diagnostics = OfflineEnvironment.create(host, game)
