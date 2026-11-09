@@ -1,3 +1,5 @@
+-- Kotost Hub / 0.2 beta / complete v4 source + local cosmetic extensions
+-- See KotostHub_README.txt for runtime limitations and media helper setup.
 --[[
     kotost games hub - Murder Mystery 2
     intro -> menu, executor tests (Info tab), lock system (Requires = {"fn"} on Toggle/Button)
@@ -5,54 +7,7 @@
 
 if not getgenv then return end
 
--- ============ MOBILE: detection + early sign of life ============
-do
-    local genv = getgenv()
-    genv.__KotostBlackGuardId = (genv.__KotostBlackGuardId or 0) + 1
-    local guardId = genv.__KotostBlackGuardId
-    task.spawn(function()
-        local Players = game:GetService("Players")
-        local since = {}
-        while getgenv().__KotostBlackGuardId == guardId do
-            task.wait(1.5)
-            pcall(function()
-                local lp = Players.LocalPlayer
-                local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
-                local char = lp and lp.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if not pg or not hum or hum.Health <= 0 then since = {}; return end
-                local cam = workspace.CurrentCamera
-                local vp = cam and cam.ViewportSize
-                if not vp or vp.X < 10 then return end
-                local now, present = os.clock(), {}
-                for _, gui in ipairs(pg:GetChildren()) do
-                    if gui:IsA("ScreenGui") and gui.Enabled and gui.Name:sub(1, 6) ~= "Kotost" then
-                        for _, obj in ipairs(gui:GetDescendants()) do
-                            if obj:IsA("Frame") and obj.Visible and obj.BackgroundTransparency < 0.05 then
-                                local c, s = obj.BackgroundColor3, obj.AbsoluteSize
-                                if c.R + c.G + c.B < 0.1 and s.X >= vp.X * 0.95 and s.Y >= vp.Y * 0.85 then
-                                    local shown, p = true, obj.Parent
-                                    while p and p ~= gui do
-                                        if p:IsA("GuiObject") and not p.Visible then shown = false; break end
-                                        p = p.Parent
-                                    end
-                                    if shown then
-                                        present[obj] = since[obj] or now
-                                        if now - present[obj] > 9 then
-                                            obj.Visible = false
-                                            present[obj] = nil
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-                since = present
-            end)
-        end
-    end)
-end
+-- Intro recovery is ownership-scoped; never hide game round/death/loading frames.
 
 do
     local okUis, uis = pcall(function() return game:GetService("UserInputService") end)
@@ -90,6 +45,10 @@ do
             corner.Parent = label
             g.Parent = pg
             getgenv().__KotostEarlySplash = g
+            task.delay(15, function()
+                pcall(function() if g.Parent then g:Destroy() end end)
+                if getgenv().__KotostEarlySplash == g then getgenv().__KotostEarlySplash = nil end
+            end)
         end)
     end
 end
@@ -262,6 +221,7 @@ do
 
     local blur = Instance.new("BlurEffect")
     blur.Size = 0
+    blur.Name = "KotostIntroBlur"
     blur.Parent = Lighting
     State.introBlur = blur
 
@@ -334,10 +294,27 @@ do
     accentLine.ZIndex = 3
     accentLine.Parent = bg
 
-    TweenService:Create(bg, TweenInfo.new(0.4), { BackgroundTransparency = 0 }):Play()
+    local finished = false
+    local function finishIntro()
+        if finished then return end
+        finished = true
+        pcall(function() gui:Destroy() end)
+        pcall(function() blur:Destroy() end)
+        if State.introGui == gui then State.introGui = nil end
+        if State.introBlur == blur then State.introBlur = nil end
+        if State.running and onDone then
+            task.defer(function()
+                local okDone, message = xpcall(onDone, function(err) return debug.traceback(tostring(err), 2) end)
+                if not okDone then warn("[Kotost] launch: " .. tostring(message)) end
+            end)
+        end
+    end
+    task.delay(8, finishIntro) -- Scheduled before animation; errors cannot leave the owned overlay behind.
+    TweenService:Create(bg, TweenInfo.new(0.4), { BackgroundTransparency = 0.35 }):Play()
     TweenService:Create(blur, TweenInfo.new(0.5), { Size = 14 }):Play()
 
     task.spawn(function()
+        local okIntro, introError = xpcall(function()
         introWait(0.15)
         TweenService:Create(mask,
             TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
@@ -361,7 +338,7 @@ do
             { Scale = 1 }):Play()
         TweenService:Create(halo, TweenInfo.new(0.35), { BackgroundTransparency = 1 }):Play()
         introWait(1.2)
-        if not State.running then return end
+        if not State.running or finished then return end
         local fadeInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
         TweenService:Create(bg, fadeInfo, { BackgroundTransparency = 1 }):Play()
         TweenService:Create(title, fadeInfo, { TextTransparency = 1 }):Play()
@@ -370,9 +347,9 @@ do
         TweenService:Create(mask, fadeInfo, { Size = UDim2.new(1, 0, 0, 0) }):Play()
         TweenService:Create(blur, fadeInfo, { Size = 0 }):Play()
         introWait(0.55)
-        pcall(function() blur:Destroy() end)
-        pcall(function() gui:Destroy() end)
-        if onDone then pcall(onDone) end
+        end, function(err) return debug.traceback(tostring(err), 2) end)
+        if not okIntro and State.running and not finished then warn("[Kotost] intro: " .. tostring(introError)) end
+        finishIntro()
     end)
 
     return gui
@@ -408,7 +385,16 @@ do
     State.getPing = getPing
     State.mobile = getgenv().__KotostMobile == true
     State.play = function(onDone)
-        State.introGui = makeIntro(onDone)
+        local okIntro, result = pcall(makeIntro, onDone)
+        if okIntro then State.introGui = result
+        else
+            warn("[Kotost] intro creation: " .. tostring(result))
+            for _, object in ipairs(GuiParent:GetChildren()) do
+                if object:IsA("ScreenGui") and object.Name:sub(1, 12) == "KotostIntro_" then pcall(function() object:Destroy() end) end
+            end
+            if State.introBlur then pcall(function() State.introBlur:Destroy() end); State.introBlur = nil end
+            if State.running and onDone then task.defer(onDone) end
+        end
     end
     State.cleanup = function()
         State.running = false
@@ -1317,6 +1303,7 @@ function KotostTab.create(environment, hub, name, icon, context)
 				table.insert(environment.getgenv().__kotostKotostUiLangHooks, function() nativeHandle:SetText(translator.tr(options.Text)) end)
 			end)
 		end
+		bindHandle(nativeHandle, options.Text)
 		track(nativeHandle)
 		return nativeHandle and nativeHandle.Base or nil
 	end
@@ -12687,35 +12674,185 @@ function KotostUI.create(environment, nova, options)
 	local minimButton = topButton("\226\128\148", -56, Color3.fromRGB(60, 60, 70))
 	local closeButton = topButton("\226\156\149", -30, Color3.fromRGB(200, 60, 60))
 
-	-- ===== tab search =====
-	local searchOpen = false
-	local searchBox = U.new("TextBox", {Name = "Search", Size = UDim2.fromOffset(0, 24), Position = UDim2.new(1, -136, 0, 4),
-		BackgroundTransparency = 1, ClipsDescendants = true, Text = "", PlaceholderText = "Search tabs", FontFace = Font.Medium(),
-		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, Visible = false, ZIndex = 5, Parent = win})
-	Theme.bind(searchBox, "TextColor3", "Text")
-	Theme.bind(searchBox, "PlaceholderColor3", "Faint")
-	local searchField = U.new("Frame", {Name = "SearchField", Size = UDim2.fromOffset(104, 24), Position = UDim2.new(1, -140, 0, 4),
-		BorderSizePixel = 0, Visible = false, ZIndex = 4, Parent = win})
-	Theme.bind(searchField, "BackgroundColor3", "Elevated")
-	U.corner(searchField, 6)
-	searchBox.Parent = searchField
-	U.pad(searchBox, 0, 6, 0, 24)
-	local searchIcon = topButton("\240\159\148\142", -138, Color3.fromRGB(60, 60, 70))
-	local function setSearchOpen(open)
-		searchOpen = open
-		searchField.Visible, searchBox.Visible = open, open
-		if open then searchBox:CaptureFocus() else searchBox.Text = "" end
+	-- Function command palette. No automatic tab switching while typing.
+	do
+		local search = {open = false, serial = 0, rows = {}, results = {}, selected = 1, query = "", index = nil}
+		local function lower(text)
+			text = string.lower(tostring(text or ""))
+			-- Lua string.lower is ASCII-only. Explicit Cyrillic case folding.
+			return (text:gsub("[\208\209][\128-\191]", function(c)
+				local ok, code = pcall(utf8.codepoint, c)
+				if ok and code >= 1040 and code <= 1071 then return utf8.char(code + 32) end
+				if ok and code == 1025 then return utf8.char(1105) end
+				return c
+			end):gsub("ё", "е"))
+		end
+		local shade = U.new("TextButton", {Name = "FunctionSearch", Text = "", Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.48, BorderSizePixel = 0,
+			Visible = false, AutoButtonColor = false, ZIndex = 100, Parent = gui})
+		local panel = U.new("Frame", {Name = "SearchPalette", Size = UDim2.fromOffset(530, 400),
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BorderSizePixel = 0,
+			Active = true, ZIndex = 101, Parent = shade})
+		Theme.bind(panel, "BackgroundColor3", "Background"); U.corner(panel, 12)
+		Theme.bind(U.stroke(panel, white, 1, 0.6), "Color", "Accent")
+		local scale = U.new("UIScale", {Scale = 1, Parent = panel})
+		local function fit()
+			local cam = E.game:GetService("Workspace").CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+			scale.Scale = math.min(1, math.max(0.1, (vp.X - 24) / 530), math.max(0.1, (vp.Y - 64) / 400))
+		end
+		label({Parent = panel, Text = "FUNCTION SEARCH", Font = Font.Semi(), Size = 12, Color = "Muted",
+			Pos = UDim2.fromOffset(18, 12), Box = UDim2.new(1, -80, 0, 20), Z = 103})
+		local field = U.new("TextBox", {Name = "FunctionQuery", Position = UDim2.fromOffset(16, 42),
+			Size = UDim2.new(1, -32, 0, 44), Text = "", PlaceholderText = "Search functions / Поиск функций…",
+			FontFace = Font.Medium(), TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left,
+			ClearTextOnFocus = false, BorderSizePixel = 0, ZIndex = 103, Parent = panel})
+		Theme.bind(field, "BackgroundColor3", "Elevated"); Theme.bind(field, "TextColor3", "Text")
+		Theme.bind(field, "PlaceholderColor3", "Muted"); U.corner(field, 8); U.pad(field, 0, 10, 0, 12)
+		local list = U.new("ScrollingFrame", {Position = UDim2.fromOffset(16, 98), Size = UDim2.new(1, -32, 1, -142),
+			BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 3, ZIndex = 102, Parent = panel})
+		U.list(list, 6)
+		local empty = label({Parent = list, Text = "Type a function name", Size = 14, Color = "Muted",
+			Box = UDim2.new(1, -8, 0, 44), Z = 103})
+		local hint = label({Parent = panel, Text = "↑ ↓ select     Enter open     Esc close     Ctrl+K search", Size = 12, Color = "Muted",
+			Pos = UDim2.new(0, 18, 1, -32), Box = UDim2.new(1, -36, 0, 24), Z = 103})
+		local close = U.new("TextButton", {Text = "×", FontFace = Font.Bold(), TextSize = 20, BackgroundTransparency = 1,
+			Position = UDim2.new(1, -50, 0, 0), Size = UDim2.fromOffset(44, 40), ZIndex = 104, Parent = panel})
+		Theme.bind(close, "TextColor3", "Text")
+		local searchIcon = topButton("⌕", -112, Color3.fromRGB(60, 60, 70))
+		local function setOpen(open)
+			if window.Destroyed then return end
+			search.open, shade.Visible = open, open
+			if open then fit(); field:CaptureFocus() else field:ReleaseFocus() end
+		end
+		local function jump(entry)
+			if not entry or not entry.inst.Parent then return end
+			setOpen(false)
+			local target
+			for _, tab in ipairs(window.Tabs) do if tab.Name == entry.tab then target = tab; break end end
+			if not target then return end
+			window:SelectTab(target)
+			if entry.sub and target.SelectSub then pcall(target.SelectSub, target, entry.sub) end
+			-- Open ancestors without toggling any actual gameplay feature.
+			local ancestor = entry.inst.Parent
+			while ancestor and ancestor ~= entry.scroll do
+				if ancestor:IsA("GuiObject") and not ancestor.Visible then ancestor.Visible = true end
+				ancestor = ancestor.Parent
+			end
+			E.task.defer(function()
+				if window.Destroyed or not entry.scroll.Parent or not entry.inst.Parent then return end
+				local y = entry.inst.AbsolutePosition.Y - entry.scroll.AbsolutePosition.Y + entry.scroll.CanvasPosition.Y - 24
+				local max = math.max(0, entry.scroll.AbsoluteCanvasSize.Y - entry.scroll.AbsoluteWindowSize.Y)
+				entry.scroll.CanvasPosition = Vector2.new(0, math.clamp(y, 0, max))
+				local highlight = U.stroke(entry.row or entry.inst, Theme.resolve("Accent"), 2, 0)
+				E.task.delay(1.2, function() pcall(function() highlight:Destroy() end) end)
+			end)
+		end
+		local function select(index)
+			search.selected = math.clamp(index, 1, math.max(1, #search.results))
+			for i, row in ipairs(search.rows) do
+				row.BackgroundTransparency = i == search.selected and 0 or 0.7
+				Theme.bind(row, "BackgroundColor3", i == search.selected and "Elevated" or "Surface")
+			end
+		end
+		local function rebuild()
+			local entries, seen = {}, {}
+			local translator = window.Translator
+			for _, binding in ipairs(translator and translator.reg or {}) do
+				local inst, source = binding.inst, binding.src
+				if inst and inst.Parent and type(source) == "string" and binding.prop ~= "PlaceholderText" then
+					local scroll = inst:FindFirstAncestorOfClass("ScrollingFrame")
+					local tab = scroll and scroll:GetAttribute("KotostTabName")
+					if tab then
+						local row = inst
+						while row.Parent and row.Parent ~= scroll do
+							if ({Row = true, Toggle = true, Button = true, Slider = true, Dropdown = true, Colorpicker = true, Textbox = true, Keybind = true})[row.Name] then break end
+							row = row.Parent
+						end
+						local sub = scroll:GetAttribute("KotostSub")
+						local key = tostring(tab) .. "/" .. tostring(sub) .. "/" .. source
+						if not seen[key] then
+							seen[key] = true
+							local russian = translator.data.ru and translator.data.ru[source] or ""
+							table.insert(entries, {inst = inst, src = source, tab = tab, sub = sub, scroll = scroll, row = row,
+								text = translator.tr(source), haystack = lower(source .. " " .. tostring(russian) .. " " .. tostring(tab) .. " " .. tostring(sub or ""))})
+						end
+					end
+				end
+			end
+			search.index = entries
+		end
+		local function run(query)
+			search.serial += 1; local serial = search.serial
+			search.query = query
+			E.task.delay(0.12, function()
+				if serial ~= search.serial or window.Destroyed then return end
+				rebuild()
+				query = lower(query):gsub("^%s+", ""):gsub("%s+$", "")
+				local found = {}
+				if query ~= "" then
+					for _, entry in ipairs(search.index) do
+						if entry.inst.Parent then
+							local matched = true
+							for token in query:gmatch("%S+") do if not entry.haystack:find(token, 1, true) then matched = false; break end end
+							if matched then
+								local name = lower(entry.src)
+								local score = name == query and 0 or (name:sub(1, #query) == query and 1 or (name:find(query, 1, true) and 2 or 3))
+								table.insert(found, {entry = entry, score = score})
+							end
+						end
+					end
+				end
+				table.sort(found, function(a, b) if a.score == b.score then return a.entry.src < b.entry.src end; return a.score < b.score end)
+				search.results = {}
+				for _, row in ipairs(search.rows) do row:Destroy() end; search.rows = {}
+				empty.Visible = #found == 0
+				empty.Text = query == "" and "Type a function name / Введи название функции" or "No matches / Ничего не найдено"
+				hint.Text = query == "" and "↑ ↓ select     Enter open     Esc close     Ctrl+K search" or tostring(#found) .. " matches · showing up to 30 · Enter opens"
+				for i = 1, math.min(#found, 30) do
+					local entry = found[i].entry
+					table.insert(search.results, entry)
+					local row = U.new("TextButton", {Text = "", Size = UDim2.new(1, -6, 0, 56), BorderSizePixel = 0,
+						AutoButtonColor = false, LayoutOrder = i, ZIndex = 103, Parent = list})
+					U.corner(row, 8)
+					label({Parent = row, Text = tostring(entry.text), Font = Font.Semi(), Size = 14, Box = UDim2.new(1, -24, 0, 24),
+						Pos = UDim2.fromOffset(12, 4), Truncate = true, Z = 104})
+					label({Parent = row, Text = entry.tab .. "  /  " .. tostring(entry.sub or "General"), Size = 12, Color = "Muted",
+						Box = UDim2.new(1, -24, 0, 19), Pos = UDim2.fromOffset(12, 29), Truncate = true, Z = 104})
+					-- Instance-owned signal: destroyed when results are recycled, no growing global connection list.
+					row.Activated:Connect(function() jump(entry) end)
+					table.insert(search.rows, row)
+				end
+				list.CanvasPosition = Vector2.zero; select(1)
+			end)
+		end
+		U.connect(searchIcon.Activated, function() setOpen(not search.open); if search.open then run(field.Text) end end, window.Conns)
+		U.connect(close.Activated, function() setOpen(false) end, window.Conns)
+		U.connect(shade.Activated, function()
+			local mouse = UIS:GetMouseLocation()
+			local p, size = panel.AbsolutePosition, panel.AbsoluteSize
+			if mouse.X < p.X or mouse.X > p.X + size.X or mouse.Y < p.Y or mouse.Y > p.Y + size.Y then setOpen(false) end
+		end, window.Conns)
+		U.connect(field:GetPropertyChangedSignal("Text"), function() run(field.Text) end, window.Conns)
+		U.connect(field.FocusLost, function(enter) if enter and search.open then jump(search.results[search.selected]) end end, window.Conns)
+		U.connect(UIS.InputBegan, function(input, processed)
+			if window.Destroyed then return end
+			if input.KeyCode == Enum.KeyCode.K and (UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)) and not UIS:GetFocusedTextBox() then
+				setOpen(true); run(field.Text); return
+			end
+			if not search.open then return end
+			if input.KeyCode == Enum.KeyCode.Escape then setOpen(false)
+			elseif input.KeyCode == Enum.KeyCode.Down or input.KeyCode == Enum.KeyCode.Up then
+				select(search.selected + (input.KeyCode == Enum.KeyCode.Down and 1 or -1))
+				local row = search.rows[search.selected]
+				if row then list.CanvasPosition = Vector2.new(0, math.max(0, (search.selected - 1) * 62 - 62)) end
+			end
+		end, window.Conns)
+		function window:AttachSearch(translator) window.Translator = translator; search.index = nil end
+		function window:Search(query) setOpen(true); field.Text = tostring(query or ""); run(field.Text) end
+		function window:InvalidateSearch() search.index = nil end
 	end
-	searchIcon.MouseButton1Click:Connect(function()
-		Sound.play("click")
-		setSearchOpen(not searchOpen)
-		if not searchOpen then window:Search("") end
-	end)
-	searchBox:GetPropertyChangedSignal("Text"):Connect(function() window:Search(searchBox.Text) end)
-	searchBox.FocusLost:Connect(function(enterPressed)
-		if enterPressed and searchBox.Text ~= "" then return end
-		if searchBox.Text == "" then setSearchOpen(false) end
-	end)
 
 	-- ===== launcher (collapsed icon, top-left) =====
 	local launcher = U.new("Frame", {Name = "Launcher", Size = UDim2.fromOffset(56, 56), Position = UDim2.fromOffset(20, 20),
@@ -12846,7 +12983,7 @@ function KotostUI.create(environment, nova, options)
 	end
 	function window:OnKeyChanged(callback) table.insert(keyListeners, callback) end
 	U.connect(UIS.InputBegan, function(input, processed)
-		if window.Destroyed or window.Listening or processed then return end
+		if window.Destroyed or window.Listening or processed or UIS:GetFocusedTextBox() then return end
 		if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == window.Key then window:Toggle() end
 	end, window.Conns)
 
@@ -13850,50 +13987,6 @@ function KotostUI.create(environment, nova, options)
 		end, window.Conns)
 	end
 
-	-- ===== tab search (data comes from translator.reg, filled in by KotostTab) =====
-	function window:AttachSearch(translator)
-		window.Translator = translator
-	end
-	function window:Search(query)
-		query = string.lower(tostring(query or ""))
-		if query == "" then
-			for _, t in ipairs(window.Tabs) do t.Button.Visible = true end
-			return
-		end
-		local matchedTabs, firstHit = {}, nil
-		local translator = window.Translator
-		if translator and translator.reg then
-			for _, binding in ipairs(translator.reg) do
-				local inst, source = binding.inst, binding.src
-				if inst and inst.Parent and type(source) == "string" and string.find(string.lower(source), query, 1, true) then
-					local scroll = inst:FindFirstAncestorOfClass("ScrollingFrame")
-					local tabName = scroll and scroll:GetAttribute("KotostTabName")
-					if tabName then
-						matchedTabs[tabName] = true
-						if not firstHit then firstHit = {tabName = tabName, subKey = scroll:GetAttribute("KotostSub"), inst = inst, scroll = scroll} end
-					end
-				end
-			end
-		end
-		for _, t in ipairs(window.Tabs) do
-			local nameMatch = string.find(string.lower(t.Name), query, 1, true) ~= nil
-			t.Button.Visible = nameMatch or matchedTabs[t.Name] == true
-		end
-		if firstHit then
-			for _, t in ipairs(window.Tabs) do
-				if t.Name == firstHit.tabName then
-					window:SelectTab(t)
-					if firstHit.subKey and t.SelectSub then pcall(t.SelectSub, t, firstHit.subKey) end
-					E.task.defer(function()
-						if not firstHit.inst.Parent or not firstHit.scroll.Parent then return end
-						local targetY = firstHit.inst.AbsolutePosition.Y - firstHit.scroll.AbsolutePosition.Y + firstHit.scroll.CanvasPosition.Y - 20
-						pcall(function() firstHit.scroll.CanvasPosition = Vector2.new(firstHit.scroll.CanvasPosition.X, math.max(0, targetY)) end)
-					end)
-					break
-				end
-			end
-		end
-	end
 
 	-- ===== destroy =====
 	function window:Destroy()
@@ -38092,6 +38185,7 @@ function VisualWorld.apply(state)
 	state.applying = true
 	local ok, message = pcall(function()
 		local context, v = state.context, state.values
+		if context.betaVibeBefore then context.betaVibeBefore() end
 		local env, lighting = context.environment, context.lighting
 		local sync = function(object, property, enabled, value) VisualWorld.sync(state, object, property, enabled, value) end
 		local technology
@@ -38178,6 +38272,7 @@ function VisualWorld.apply(state)
 		pcall(VisualWorld.materials, state, v.mats)
 		VisualWorld.lamps(state)
 		VisualWorld.overlay(state)
+		if context.betaVibeApply then context.betaVibeApply() end
 	end)
 	state.applying = false
 	if not ok then state.context.environment.warn("[Kotost] shaders: " .. tostring(message)) end
@@ -48224,6 +48319,790 @@ function KotostApplication.installInfo(context)
 	end
 end
 
+-- 0.2 beta: local cosmetic extensions; no server remotes or automatic OS execution.
+local KotostBeta = {Version = "0.2 beta"}
+KotostBeta.Releases = {
+    {version = "0.1 beta", title = "Base build", notes = {
+        "Existing hub: tabs, themes, configuration and executor capability panel.",
+        "Existing world lighting, sky, weather, appearance and music tools.",
+        "Baseline reconstructed from the supplied v4 file; not a dated historical release."
+    }},
+    {version = "0.2 beta", title = "World & interface", notes = {
+        "Intro: bounded lifetime, cleanup on errors and a single launch path.",
+        "Removed the old guard that hid unrelated black frames in the game UI.",
+        "Lobby Changer: eight looks, cancellable staging and original-lobby restoration.",
+        "Search: ranked bilingual function results, keyboard navigation and click-to-jump.",
+        "Changelogs: one page per release and persistent seen flags.",
+        "Sound Viewer: draggable media window and optional Windows media-session bridge.",
+        "Vibe / Winter 2021: soft purple window lighting, gentle bloom and local snow."
+    }}
+}
+KotostBeta.Lobbies = {
+    {code = "Default", label = "Default", id = 7375245349},
+    {code = "Halloween", label = "Halloween", id = 128697698732221},
+    {code = "Christmas", label = "Christmas", id = 6134924833},
+    {code = "Christmas 2", label = "Christmas 2", id = 14607702212},
+    {code = "Christmas 3", label = "Christmas 3", id = 8390939579},
+    {code = "Summer", label = "Summer", id = 14534220661},
+    {code = "Christmas 4", label = "Christmas 4", id = 9111053019},
+    {code = "Easter", label = "Easter", id = 114241998962056}
+}
+
+-- Incremental traversal. A native GetObjects call itself cannot be split into frames.
+function KotostBeta.walk(root, visit, valid, limit)
+    local stack, count, started = {root}, 0, os.clock()
+    while #stack > 0 do
+        if valid and not valid() then return false, "cancelled" end
+        local object = table.remove(stack)
+        count += 1
+        if limit and count > limit then return false, "Model exceeds the object budget" end
+        local descend = visit(object, count)
+        if descend ~= false then
+            for _, child in ipairs(object:GetChildren()) do table.insert(stack, child) end
+        end
+        if os.clock() - started > 0.003 then task.wait(); started = os.clock() end
+    end
+    return true, count
+end
+
+function KotostBeta.retire(root)
+    if not root then return end
+    pcall(function() root.Parent = nil end)
+    task.spawn(function()
+        -- Leaf-first destruction spreads Lua/engine cleanup across frames.
+        local stack, order, start = {root}, {}, os.clock()
+        while #stack > 0 do
+            local object = table.remove(stack)
+            table.insert(order, object)
+            for _, child in ipairs(object:GetChildren()) do table.insert(stack, child) end
+            if os.clock() - start > 0.003 then task.wait(); start = os.clock() end
+        end
+        for i = #order, 1, -1 do
+            pcall(function() order[i]:Destroy() end)
+            if i % 120 == 0 then task.wait() end
+        end
+    end)
+end
+
+function KotostBeta.ui(ctx)
+    local U, theme, nova = ctx.nova.U, ctx.nova.Theme, ctx.nova
+    local ui = {}
+    function ui.make(class, props, parent, role)
+        props.Parent = parent
+        local object = U.new(class, props)
+        if role then theme.bind(object, "BackgroundColor3", role) end
+        return object
+    end
+    function ui.text(parent, text, x, y, w, h, role, size)
+        return nova.label({Parent = parent, Text = text, Size = size or 14, Color = role or "Text",
+            Pos = UDim2.fromOffset(x, y), Box = UDim2.new(w < 0 and 1 or 0, w, 0, h), Z = 12})
+    end
+    function ui.button(parent, text, x, y, w, callback)
+        local b = ui.make("TextButton", {Text = text, FontFace = nova.Font.Semi(), TextSize = 14,
+            Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, 44), BorderSizePixel = 0,
+            AutoButtonColor = true, ZIndex = 13}, parent, "Elevated")
+        theme.bind(b, "TextColor3", "Text"); U.corner(b, 8)
+        ctx.connect(b.Activated, function() if not ctx.window.Destroyed then callback() end end)
+        return b
+    end
+    function ui.panel(name, width, height)
+        local root = ui.make("Frame", {Name = name, AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(width, height),
+            BorderSizePixel = 0, Active = true, ZIndex = 10}, ctx.window.Gui, "Background")
+        U.corner(root, 12); theme.bind(U.stroke(root, Color3.new(1, 1, 1), 1, 0.7), "Color", "Accent")
+        local scaler = ui.make("UIScale", {Scale = 1}, root)
+        local header = ui.make("Frame", {Size = UDim2.new(1, -64, 0, 58), BackgroundTransparency = 1,
+            Active = true, ZIndex = 11}, root)
+        local dragging, start, origin, touch = false, nil, nil, nil
+        local function fit()
+            local camera = workspace.CurrentCamera
+            local vp = camera and camera.ViewportSize or Vector2.new(800, 600)
+            scaler.Scale = math.min(1, math.max(0.1, (vp.X - 24) / width), math.max(0.1, (vp.Y - 64) / height))
+            local sx, sy = width * scaler.Scale, height * scaler.Scale
+            local px = vp.X * root.Position.X.Scale + root.Position.X.Offset
+            local py = vp.Y * root.Position.Y.Scale + root.Position.Y.Offset
+            root.Position = UDim2.fromOffset(math.clamp(px, sx / 2 + 4, math.max(sx / 2 + 4, vp.X - sx / 2 - 4)),
+                math.clamp(py, sy / 2 + 4, math.max(sy / 2 + 4, vp.Y - sy / 2 - 36)))
+        end
+        ctx.connect(header.InputBegan, function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging, start, origin = true, input.Position, root.Position
+                touch = input.UserInputType == Enum.UserInputType.Touch and input or nil
+            end
+        end)
+        ctx.connect(ctx.input.InputChanged, function(input)
+            if dragging and (input == touch or (not touch and input.UserInputType == Enum.UserInputType.MouseMovement)) then
+                local delta = input.Position - start
+                root.Position = UDim2.new(origin.X.Scale, origin.X.Offset + delta.X, origin.Y.Scale, origin.Y.Offset + delta.Y)
+                fit()
+            end
+        end)
+        ctx.connect(ctx.input.InputEnded, function(input)
+            if input == touch or input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false; touch = nil end
+        end)
+        local watched
+        local function cameraChanged()
+            if watched then watched:Disconnect() end
+            if workspace.CurrentCamera then watched = ctx.connect(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), fit) end
+            fit()
+        end
+        ctx.connect(workspace:GetPropertyChangedSignal("CurrentCamera"), cameraChanged)
+        cameraChanged()
+        return root
+    end
+    return ui
+end
+
+function KotostBeta.changelog(ctx, ui)
+    local globals = getgenv()
+    globals.__KotostSeenReleases = globals.__KotostSeenReleases or {}
+    local host, flags, available = ctx.host, globals.__KotostSeenReleases, false
+    local path = "KotostHub/changelogs_seen.txt"
+    local ok, content = pcall(function() return host.readfile(path) end)
+    if ok and type(content) == "string" then
+        for line in content:gmatch("[^\r\n]+") do
+            local version, value = line:match("^%s*(.-)%s*=%s*(%a+)%s*$")
+            if version then flags[version] = value == "true" end
+        end
+    end
+    for _, release in ipairs(KotostBeta.Releases) do
+        if flags[release.version] == nil then flags[release.version] = false end
+    end
+    local function save()
+        local lines = {}
+        for _, release in ipairs(KotostBeta.Releases) do table.insert(lines, release.version .. " = " .. tostring(flags[release.version])) end
+        available = pcall(function()
+            if host.makefolder then pcall(host.makefolder, "KotostHub") end
+            assert(type(host.writefile) == "function", "writefile unavailable")
+            host.writefile(path, table.concat(lines, "\n") .. "\n")
+        end)
+        return available
+    end
+    save() -- New releases are persisted as false before their page is displayed.
+    local panel = ui.panel("KotostChangelogs", 520, 390)
+    panel.Visible = false
+    ui.text(panel, "CHANGELOGS", 24, 18, 380, 26, "Text", 19)
+    local heading = ui.text(panel, "", 24, 70, -48, 30, "Accent", 18)
+    local caption = ui.text(panel, "", 24, 103, -48, 22, "Muted", 13)
+    local scroll = ui.make("ScrollingFrame", {Position = UDim2.fromOffset(24, 138), Size = UDim2.new(1, -48, 0, 174),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 12}, panel)
+    local body = ui.text(scroll, "", 0, 0, -12, 0, "Text", 14)
+    body.AutomaticSize = Enum.AutomaticSize.Y; body.TextWrapped = true; body.TextYAlignment = Enum.TextYAlignment.Top
+    local page, indicator = #KotostBeta.Releases, ui.text(panel, "", 208, 333, 105, 28, "Muted", 13)
+    local function show(index)
+        page = math.clamp(index, 1, #KotostBeta.Releases)
+        local chosen = page
+        local release = KotostBeta.Releases[page]
+        heading.Text, caption.Text = release.version .. " / " .. release.title, available and "Saved locally · shown once per release" or "File access unavailable · remembered for this session only"
+        local notes = {}; for _, text in ipairs(release.notes) do table.insert(notes, "• " .. text) end
+        body.Text = table.concat(notes, "\n\n"); scroll.CanvasPosition = Vector2.zero
+        indicator.Text = tostring(page) .. " / " .. tostring(#KotostBeta.Releases)
+        panel.Visible = true
+        task.defer(function()
+            if panel.Parent and panel.Visible and page == chosen then flags[release.version] = true; save() end
+        end)
+    end
+    ui.button(panel, "‹ Previous", 24, 326, 145, function() show(page - 1) end)
+    ui.button(panel, "Next ›", 351, 326, 145, function() show(page + 1) end)
+    ui.button(panel, "×", 456, 10, 44, function() panel.Visible = false end)
+    ctx.general:Sub("UI"); ctx.general:Group({Title = "Updates"})
+    ctx.general:Button({Text = "Changelogs", Callback = function() show(#KotostBeta.Releases) end})
+    task.defer(function()
+        if not ctx.window.Destroyed and not flags[KotostBeta.Version] then show(#KotostBeta.Releases) end
+    end)
+end
+
+function KotostBeta.lobby(ctx)
+    local s = {on = false, selected = "Default", serial = 0, saved = {}, original = nil, root = nil, busy = false, dead = false, offset = Vector3.zero}
+    local status, toggle
+    local function report(text) if status and status.Parent then status.Text = text end end
+    local function note(text) pcall(function() ctx.window:Notify({Title = "Lobby Changer", Text = text, Kind = "warning"}) end) end
+    local function restore()
+        local saved = s.saved; s.saved = {}
+        -- Restore immediately on disable, even while a native asset request is pending.
+        for object, props in pairs(saved) do
+            for property, entry in pairs(props) do pcall(function() if object[property] == entry.applied then object[property] = entry.before end end) end
+        end
+        if s.originalConnection then s.originalConnection:Disconnect(); s.originalConnection = nil end
+        s.original = nil
+    end
+    local function setHidden(object)
+        local property, value
+        if object:IsA("BasePart") then property, value = "LocalTransparencyModifier", 1
+        elseif object:IsA("Decal") or object:IsA("Texture") then property, value = "Transparency", 1
+        elseif object:IsA("Light") or object:IsA("ParticleEmitter") or object:IsA("Beam") or object:IsA("Trail") or object:IsA("LayerCollector") then property, value = "Enabled", false end
+        if property then
+            pcall(function()
+                if not s.saved[object] then s.saved[object] = {} end
+                if not s.saved[object][property] then s.saved[object][property] = {before = object[property], applied = value} end
+                object[property] = value
+            end)
+        end
+    end
+    local function originalLobby()
+        local object = workspace:FindFirstChild("Lobby")
+        if not object or (not object:IsA("Model") and not object:IsA("BasePart")) then error("workspace.Lobby must be a Model or BasePart") end
+        return object
+    end
+    local function bounds(object)
+        if object:IsA("Model") then return object:GetBoundingBox() end
+        return object.CFrame, object.Size
+    end
+    local function hideOriginal(original, valid)
+        if s.original == original then return true end
+        restore(); s.original = original
+        s.originalConnection = ctx.connect(original.DescendantAdded, function(object)
+            if s.on and not s.dead and s.original == original then setHidden(object) end
+        end)
+        return KotostBeta.walk(original, setHidden, valid)
+    end
+    local function load(id, valid)
+        local loaded
+        local ok, err = pcall(function() loaded = game:GetObjects("rbxassetid://" .. tostring(id)) end)
+        if not ok or type(loaded) ~= "table" or #loaded == 0 then error("Asset unavailable or blocked: " .. tostring(err)) end
+        local root = Instance.new("Model"); root.Name = "KotostLocalLobby"
+        for _, object in ipairs(loaded) do object.Parent = root end
+        s.staging = root
+        local parts = 0
+        local traversed, reason = KotostBeta.walk(root, function(object)
+            -- Imported code is never moved into Workspace, including ModuleScripts.
+            if object:IsA("LuaSourceContainer") or object:IsA("RemoteEvent") or object:IsA("RemoteFunction")
+                or object:IsA("ProximityPrompt") or object:IsA("ClickDetector") or object:IsA("Sound")
+                or object:IsA("Humanoid") or object:IsA("JointInstance") or object:IsA("Constraint") then
+                object:Destroy(); return false
+            end
+            if object:IsA("BasePart") then
+                parts += 1; object.Anchored = true; object.CanCollide = false; object.CanTouch = false; object.CanQuery = false
+            end
+            if object:IsA("Light") then object.Shadows = false end
+            if object:IsA("ParticleEmitter") then object.Rate = math.min(object.Rate, 18) end
+            if object:IsA("LayerCollector") then object.Enabled = false end
+        end, valid, 24000)
+        if not traversed then error(reason) end
+        if parts == 0 then error("Asset contains no renderable parts") end
+        return root
+    end
+    local function requestChange()
+        s.serial += 1
+        if not s.on then
+            restore()
+            local old = s.root; s.root = nil; KotostBeta.retire(old)
+            report("Original lobby restored")
+        end
+        if s.busy or s.dead then return end
+        s.busy = true
+        task.spawn(function()
+            local observed = -1
+            while not s.dead and observed ~= s.serial do
+                observed = s.serial
+                local epoch, selected = observed, s.selected
+                local function valid() return not s.dead and s.on and epoch == s.serial and not ctx.window.Destroyed end
+                if s.on then
+                    report("Loading " .. selected .. "… original remains visible until ready")
+                    local ok, err = xpcall(function()
+                        local original = originalLobby()
+                        local spec; for _, option in ipairs(KotostBeta.Lobbies) do if option.code == selected then spec = option end end
+                        assert(spec, "Unknown lobby")
+                        local candidate = load(spec.id, valid)
+                        if not valid() then error("cancelled") end
+                        local target, targetSize = bounds(original)
+                        local current, size = bounds(candidate)
+                        -- Align horizontal centers, original rotation and bounding-box floor height.
+                        -- Deliberately do not scale different seasonal maps to the same size.
+                        local desired = target * CFrame.new(s.offset + Vector3.new(0, (size.Y - targetSize.Y) / 2, 0))
+                        candidate:PivotTo(desired * current:Inverse() * candidate:GetPivot())
+                        if not valid() or workspace:FindFirstChild("Lobby") ~= original then error("Lobby changed while loading; retry") end
+                        if not hideOriginal(original, valid) then error("cancelled") end
+                        if not valid() then error("cancelled") end
+                        local previous = s.root
+                        candidate.Parent = workspace; s.root, s.staging = candidate, nil
+                        KotostBeta.retire(previous)
+                        report(selected .. " · local appearance only; original collision retained")
+                    end, function(message) return tostring(message) end)
+                    if s.staging then local stale = s.staging; s.staging = nil; KotostBeta.retire(stale) end
+                    if not ok and not s.root then restore() end
+                    if not ok and valid() then
+                        if not s.root then restore(); s.on = false; if toggle then toggle.SetSilent(false) end end
+                        report("Not changed: " .. tostring(err)); note(tostring(err))
+                    elseif not s.on then restore() end
+                end
+            end
+            s.busy = false
+        end)
+    end
+    local section = ctx.visuals
+    section:Sub("World"); section:Group({Title = "Local world", Side = "Left", Pin = true})
+    toggle = section:Toggle({Text = "Lobby Changer", Default = false, NoSave = true, Settings = function()
+        section:Dropdown({Text = "Lobby look", Options = KotostBeta.Lobbies, Default = "Default", NoSave = true, TranslateOptions = false,
+            Callback = function(value) if value then s.selected = value; if s.on then requestChange() end end end})
+        for axis = 1, 3 do
+            local component = axis
+            section:Slider({Text = "Lobby offset " .. ({"X", "Y", "Z"})[axis], Min = -100, Max = 100, Decimals = 1, Default = 0, NoSave = true,
+                Callback = function(value)
+                    local old = s.offset
+                    local updated = Vector3.new(component == 1 and value or old.X, component == 2 and value or old.Y, component == 3 and value or old.Z)
+                    s.offset = updated
+                    if s.root and s.original then
+                        pcall(function()
+                            local rotation = s.original:IsA("Model") and select(1, s.original:GetBoundingBox()) or s.original.CFrame
+                            local delta = rotation:VectorToWorldSpace(updated - old)
+                            s.root:PivotTo(s.root:GetPivot() + delta)
+                        end)
+                    end
+                end})
+        end
+        section:Note({Text = "Cosmetic only: original collision stays. Loading depends on asset permissions."})
+    end, Callback = function(on) s.on = on; requestChange() end})
+    status = section:Note({Text = "Original lobby · disabled"})
+    -- Reapply only when the actual server lobby instance changes, not every frame.
+    ctx.connect(workspace.ChildAdded, function(object)
+        if object.Name == "Lobby" and s.on then requestChange() end
+    end)
+    ctx.connect(workspace.ChildRemoved, function(object)
+        if object == s.original then
+            restore(); local old = s.root; s.root = nil; KotostBeta.retire(old)
+            if s.on then s.serial += 1; report("Waiting for workspace.Lobby…") end
+        end
+    end)
+    return function()
+        s.dead, s.on = true, false; s.serial += 1; restore()
+        local old = s.root; s.root = nil; KotostBeta.retire(old)
+    end
+end
+
+function KotostBeta.vibe(ctx)
+    local s = {on = false, epoch = 0, owned = {}, lights = {}, lightParts = {}, saved = {}, effects = {}}
+    local lighting, section = game:GetService("Lighting"), ctx.visuals
+    local function own(object) table.insert(s.owned, object); return object end
+    local function apply()
+        if not s.on then return end
+        for property, value in pairs({ClockTime = 17.8, Brightness = 2.1, Ambient = Color3.fromRGB(95, 83, 125),
+            OutdoorAmbient = Color3.fromRGB(110, 112, 145), ExposureCompensation = 0.08, ShadowSoftness = 0.7}) do
+            if not s.saved[property] then s.saved[property] = {before = lighting[property], applied = value}
+            elseif lighting[property] ~= s.saved[property].applied then s.saved[property].before = lighting[property] end
+            lighting[property] = value
+        end
+        for _, effect in ipairs(s.effects) do if effect.Parent then effect.Enabled = true end end
+    end
+    local previousApply = ctx.visualWorld.context.betaVibeApply
+    local previousBefore = ctx.visualWorld.context.betaVibeBefore
+    local function beforeShaders()
+        if not s.on then return end
+        for property, entry in pairs(s.saved) do
+            pcall(function() if lighting[property] == entry.applied then lighting[property] = entry.before end end)
+        end
+        s.saved = {}
+    end
+    ctx.visualWorld.context.betaVibeApply = apply
+    ctx.visualWorld.context.betaVibeBefore = beforeShaders
+    local function stop()
+        s.on = false; s.epoch += 1
+        if s.connection then s.connection:Disconnect(); s.connection = nil end
+        if s.added then s.added:Disconnect(); s.added = nil end
+        for _, object in ipairs(s.owned) do pcall(function() object:Destroy() end) end
+        s.owned, s.lights, s.lightParts, s.effects = {}, {}, {}, {}
+        for property, entry in pairs(s.saved) do pcall(function() if lighting[property] == entry.applied then lighting[property] = entry.before end end) end
+        s.saved = {}
+        if ctx.visualWorld.values.on then VisualWorld.request(ctx.visualWorld) end
+    end
+    local function start()
+        stop(); s.on = true; local epoch = s.epoch
+        local function effect(class, props)
+            local object = own(Instance.new(class)); object.Name = "KotostWinter2021"
+            for key, value in pairs(props) do object[key] = value end
+            object.Parent = lighting; table.insert(s.effects, object); return object
+        end
+        effect("ColorCorrectionEffect", {TintColor = Color3.fromRGB(245, 235, 255), Brightness = 0.015, Contrast = 0.05, Saturation = -0.06})
+        effect("BloomEffect", {Intensity = 0.2, Size = 26, Threshold = 1.25})
+        effect("BlurEffect", {Size = 1.1})
+        local snow = own(Instance.new("Part")); snow.Name = "KotostWinterSnow"
+        snow.Anchored, snow.CanCollide, snow.CanTouch, snow.CanQuery, snow.Transparency = true, false, false, false, 1
+        snow.Size = Vector3.new(55, 0.1, 55)
+        local cam = workspace.CurrentCamera; snow.Position = cam and cam.CFrame.Position + Vector3.new(0, 20, 0) or Vector3.new(0, 50, 0)
+        local emitter = Instance.new("ParticleEmitter"); emitter.Name = "GentleSnow"
+        emitter.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+        emitter.Rate = ctx.input.TouchEnabled and 22 or 40; emitter.Lifetime = NumberRange.new(5, 7)
+        emitter.Speed = NumberRange.new(4, 6); emitter.Acceleration = Vector3.new(0.6, -1.2, 0.25)
+        emitter.EmissionDirection = Enum.NormalId.Bottom; emitter.SpreadAngle = Vector2.new(12, 12)
+        emitter.Size = NumberSequence.new(0.1); emitter.LightEmission = 0.35
+        emitter.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.12, 0.2), NumberSequenceKeypoint.new(0.85, 0.3), NumberSequenceKeypoint.new(1, 1)})
+        emitter.Parent = snow; snow.Parent = workspace
+        local function addWindow(part)
+            if not s.on or s.epoch ~= epoch or not part:IsA("BasePart") or s.lightParts[part] or #s.lights >= 24 then return end
+            local name = part.Name:lower()
+            local parentName = part.Parent and part.Parent.Name:lower() or ""
+            if not (name:find("window", 1, true) or name:find("glass", 1, true) or parentName:find("window", 1, true) or name:find("окн", 1, true)) then return end
+            if part.Size.Magnitude > 60 then return end
+            s.lightParts[part] = true
+            local light = own(Instance.new("PointLight")); light.Name = "KotostWinterWindow"
+            light.Color, light.Brightness, light.Range, light.Shadows = Color3.fromRGB(180, 120, 255), 0.65, 13, false
+            light.Parent = part; table.insert(s.lights, light)
+        end
+        local lobby = workspace:FindFirstChild("KotostLocalLobby") or workspace:FindFirstChild("Lobby")
+        if lobby then task.spawn(function() KotostBeta.walk(lobby, addWindow, function() return s.on and s.epoch == epoch end, 30000) end) end
+        s.added = ctx.connect(workspace.DescendantAdded, function(object)
+            if s.on and object:IsA("BasePart") then
+                local lobbyRoot = workspace:FindFirstChild("KotostLocalLobby") or workspace:FindFirstChild("Lobby")
+                if lobbyRoot and object:IsDescendantOf(lobbyRoot) then addWindow(object) end
+            end
+        end)
+        local elapsed, refresh = 0, 0
+        s.connection = ctx.connect(ctx.runService.Heartbeat, function(dt)
+            elapsed += dt; refresh += dt
+            if elapsed < 0.1 then return end
+            elapsed = 0
+            local camera = workspace.CurrentCamera
+            if camera then snow.CFrame = CFrame.new(camera.CFrame.Position + Vector3.new(0, 20, 0)) end
+            local t = os.clock()
+            for i, light in ipairs(s.lights) do if light.Parent then light.Brightness = 0.65 + math.sin(t * 0.7 + i * 1.6) * 0.075 end end
+            if refresh >= 1 then apply(); refresh = 0 end
+        end)
+        apply()
+    end
+    section:Sub("World"); section:Group({Title = "Atmosphere", Side = "Right", Pin = true})
+    section:Toggle({Text = "Vibe", Default = false, NoSave = true, Settings = function()
+        section:Dropdown({Text = "Vibe look", Options = {{code = "Winter 2021", label = "Winter 2021"}}, Default = "Winter 2021", NoSave = true,
+            Callback = function() end})
+        section:Note({Text = "Soft violet windows, subtle blur and snow. Vibe overrides shared lighting while enabled."})
+    end, Callback = function(on) if on then start() else stop() end end})
+    return function() stop(); ctx.visualWorld.context.betaVibeApply = previousApply; ctx.visualWorld.context.betaVibeBefore = previousBefore end
+end
+
+function KotostBeta.sound(ctx, ui)
+    local host, http = ctx.host, game:GetService("HttpService")
+    local state = {on = false, epoch = 0, busy = false, data = {}, commandBusy = false, artRevision = nil}
+    local token, request, panel, toggle, title, artist, source, elapsed, fill, play, nextButton, prevButton, artwork, rail
+    local setupWarning = false
+    local function setup()
+        request = host.request or host.http_request or (host.syn and host.syn.request) or (host.http and host.http.request)
+        assert(type(request) == "function", "HTTP requests are unavailable in this executor")
+        assert(type(host.writefile) == "function" and type(host.readfile) == "function", "Real file read/write access is required")
+        if host.makefolder then pcall(host.makefolder, "KotostHub") end
+        local ok, value = pcall(host.readfile, "KotostHub/media_token.txt")
+        token = ok and type(value) == "string" and value:match("^%s*([%w%-]+)%s*$") or nil
+        if not token or #token < 24 then token = http:GenerateGUID(false) .. http:GenerateGUID(false); host.writefile("KotostHub/media_token.txt", token) end
+        -- Source is written for explicit, manual execution only. Never shell/execute it.
+        host.writefile("KotostHub/media_bridge.py", KotostBeta.MediaBridgeSource)
+        host.writefile("KotostHub/MEDIA_README.txt", "Windows 10/11 only. Run this helper manually, without administrator rights.\nInstall Python dependencies:\npy -m pip install winrt-runtime winrt-Windows.Foundation winrt-Windows.Media winrt-Windows.Media.Control winrt-Windows.Storage.Streams\nThen open a terminal in this folder and run: py media_bridge.py\nOr use: py media_bridge.py --folder C:\\path\\to\\workspace\\KotostHub\nOnly apps exposing Windows media sessions are supported. Browser playback may need media keys integration. Not every app permits seeking/skipping. Android/iOS are not supported by this bridge.\nOnly loopback 127.0.0.1:17841, token authenticated. No cloud uploads or automatic execution. Close the helper window to stop.\n")
+    end
+    local function call(path, data)
+        local response = request({Url = "http://127.0.0.1:17841" .. path, Method = data and "POST" or "GET",
+            Headers = {Authorization = "Bearer " .. token, ["Content-Type"] = "application/json"},
+            Body = data and http:JSONEncode(data) or nil, Timeout = 3})
+        assert(type(response) == "table" and tonumber(response.StatusCode) == 200, "Bridge unavailable or authorization failed")
+        return response.Body
+    end
+    local function clock(value)
+        value = math.max(0, math.floor(tonumber(value) or 0))
+        return string.format("%d:%02d", math.floor(value / 60), value % 60)
+    end
+    local function command(action, position)
+        if state.commandBusy or not state.on or not state.data.available then return end
+        local flag = ({toggle = "can_toggle", next = "can_next", previous = "can_previous", seek = "can_seek"})[action]
+        if flag and not state.data[flag] then return end
+        state.commandBusy = true
+        task.spawn(function()
+            local ok, result = pcall(function() return http:JSONDecode(call("/command", {action = action, position = position})) end)
+            if panel and panel.Parent and state.on and (not ok or type(result) ~= "table" or not result.ok) then
+                source.Text = ok and type(result) == "table" and tostring(result.error or "Command declined") or "Bridge command failed"
+            end
+            state.commandBusy = false
+        end)
+    end
+    local dragging, dragFraction = false, 0
+    local function build()
+        panel = ui.panel("KotostSoundViewer", 440, 270)
+        ui.text(panel, "SOUND VIEWER", 20, 17, 300, 27, "Text", 18)
+        ui.button(panel, "×", 380, 10, 44, function() if toggle then toggle.Set(false) end end)
+        artwork = ui.make("ImageLabel", {Position = UDim2.fromOffset(20, 71), Size = UDim2.fromOffset(72, 72),
+            Image = "", BorderSizePixel = 0, ZIndex = 12, ScaleType = Enum.ScaleType.Crop}, panel, "Surface2")
+        ctx.nova.U.corner(artwork, 8)
+        title = ui.text(panel, "Waiting for media bridge…", 108, 72, -128, 28, "Text", 16)
+        title.TextTruncate = Enum.TextTruncate.AtEnd
+        artist = ui.text(panel, "", 108, 103, -128, 20, "Muted", 14); artist.TextTruncate = Enum.TextTruncate.AtEnd
+        source = ui.text(panel, "Run KotostHub/media_bridge.py manually", 20, 148, -40, 20, "Muted", 12)
+        source.TextTruncate = Enum.TextTruncate.AtEnd
+        rail = ui.make("TextButton", {Text = "", Position = UDim2.fromOffset(20, 176), Size = UDim2.new(1, -40, 0, 22),
+            BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 14, Active = true}, panel)
+        local track = ui.make("Frame", {Position = UDim2.new(0, 0, 0.5, -2), Size = UDim2.new(1, 0, 0, 4), BorderSizePixel = 0, ZIndex = 12}, rail, "Elevated")
+        ctx.nova.U.corner(track, 2)
+        fill = ui.make("Frame", {Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, ZIndex = 13}, track, "Accent")
+        ctx.nova.U.corner(fill, 2)
+        elapsed = ui.text(panel, "0:00 / 0:00", 20, 214, 100, 24, "Muted", 12)
+        prevButton = ui.button(panel, "|‹", 142, 207, 52, function() command("previous") end)
+        play = ui.button(panel, "Play", 202, 207, 80, function() command("toggle") end)
+        nextButton = ui.button(panel, "›|", 290, 207, 52, function() command("next") end)
+        local activeTouch
+        local function setPosition(x)
+            dragFraction = math.clamp((x - rail.AbsolutePosition.X) / math.max(1, rail.AbsoluteSize.X), 0, 1)
+            fill.Size = UDim2.fromScale(dragFraction, 1)
+            elapsed.Text = clock(dragFraction * (state.data.duration or 0)) .. " / " .. clock(state.data.duration)
+        end
+        ctx.connect(rail.InputBegan, function(input)
+            if state.data.can_seek and (state.data.duration or 0) > 0 and
+                (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+                dragging = true; activeTouch = input.UserInputType == Enum.UserInputType.Touch and input or nil; setPosition(input.Position.X)
+            end
+        end)
+        ctx.connect(ctx.input.InputChanged, function(input)
+            if dragging and (input == activeTouch or (not activeTouch and input.UserInputType == Enum.UserInputType.MouseMovement)) then setPosition(input.Position.X) end
+        end)
+        ctx.connect(ctx.input.InputEnded, function(input)
+            if dragging and (input == activeTouch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+                dragging = false; command("seek", dragFraction * (state.data.duration or 0)); activeTouch = nil
+            end
+        end)
+    end
+    local function activate(on)
+        state.on = on; state.epoch += 1; local epoch = state.epoch
+        if not on then if panel then panel.Visible = false end; return end
+        if not panel then build() end; panel.Visible = true
+        local ok, err = pcall(setup)
+        if not ok then source.Text = tostring(err); state.on = false; task.defer(function() if toggle then toggle.SetSilent(false) end end); return end
+        if not setupWarning then
+            setupWarning = true
+            ctx.window:Notify({Title = "Sound Viewer", Text = "Helper saved in KotostHub. Run media_bridge.py manually on Windows. See MEDIA_README.txt.", Kind = "info"})
+        end
+        task.spawn(function()
+            while state.on and epoch == state.epoch and not ctx.window.Destroyed do
+                if not state.busy then
+                    state.busy = true
+                    local okState, data = pcall(function() return http:JSONDecode(call("/state")) end)
+                    if epoch == state.epoch and state.on then
+                        if okState and type(data) == "table" then
+                            state.data = data
+                            title.Text = data.available and tostring(data.title) or "No active media session"
+                            artist.Text = data.available and tostring(data.artist or "") or "Start playback in a supported app"
+                            source.Text = data.error or data.source or "Windows media sessions · connected"
+                            play.Text = data.playing and "Pause" or "Play"
+                            for _, entry in ipairs({{play, data.can_toggle}, {nextButton, data.can_next}, {prevButton, data.can_previous}}) do
+                                entry[1].Active = entry[2] == true; entry[1].TextTransparency = entry[2] and 0 or 0.6
+                            end
+                            if not dragging then
+                                fill.Size = UDim2.fromScale((data.duration or 0) > 0 and math.clamp((data.position or 0) / data.duration, 0, 1) or 0, 1)
+                                elapsed.Text = clock(data.position) .. " / " .. clock(data.duration)
+                            end
+                            if not data.has_artwork then artwork.Image = ""; state.artRevision = nil
+                            elseif data.artwork_revision ~= state.artRevision and type(host.getcustomasset or host.getsynasset) == "function" then
+                                local okArt = pcall(function()
+                                    local bytes = call("/artwork"); assert(#bytes <= 4 * 1024 * 1024)
+                                    local extension = tostring(data.artwork_mime):find("jpeg", 1, true) and ".jpg" or ".png"
+                                    local revision = data.artwork_revision
+                                    local path = "KotostHub/media_cover_" .. tostring(revision) .. extension
+                                    host.writefile(path, bytes)
+                                    local asset = (host.getcustomasset or host.getsynasset)(path)
+                                    if epoch == state.epoch and state.on then artwork.Image = asset; state.artRevision = revision end
+                                    -- Keep at most the most recent two disk covers, avoiding texture-cache reuse.
+                                    if state.oldCover and host.delfile then pcall(host.delfile, state.oldCover) end
+                                    state.oldCover = state.cover; state.cover = path
+                                end)
+                                if not okArt then artwork.Image = "" end
+                            end
+                        else
+                            state.data = {}; title.Text = "Bridge disconnected"; artist.Text = "Run media_bridge.py on Windows"
+                            source.Text = "No access to external music without the helper"; artwork.Image = ""
+                            state.artRevision = nil; fill.Size = UDim2.fromScale(0, 1)
+                        end
+                    end
+                    state.busy = false
+                end
+                task.wait(0.65)
+            end
+        end)
+    end
+    ctx.general:Sub("UI"); ctx.general:Group({Title = "Desktop media"})
+    toggle = ctx.general:Toggle({Text = "Sound Viewer", Default = false, NoSave = true, Callback = activate})
+    ctx.general:Note({Text = "Windows helper required. Only apps publishing system media sessions; no universal browser/audio capture."})
+    return function() activate(false) end
+end
+
+function KotostBeta.install(ctx)
+    local ui = KotostBeta.ui(ctx)
+    local stops = {}
+    -- Register cleanup before initialization; even partial initialization is reversible.
+    ctx.betaStops = stops
+    for _, entry in ipairs({{"Lobby Changer", function() return KotostBeta.lobby(ctx) end},
+        {"Vibe", function() return KotostBeta.vibe(ctx) end},
+        {"Sound Viewer", function() return KotostBeta.sound(ctx, ui) end},
+        {"Changelogs", function() KotostBeta.changelog(ctx, ui) end}}) do
+        local ok, cleanup = pcall(entry[2])
+        if ok and type(cleanup) == "function" then table.insert(stops, cleanup)
+        elseif not ok then warn("[Kotost 0.2] " .. entry[1] .. ": " .. tostring(cleanup)) end
+    end
+    return function() for i = #stops, 1, -1 do pcall(stops[i]) end end
+end
+
+KotostBeta.MediaBridgeSource = [=====["""Kotost Sound Viewer bridge. Windows 10/11; run manually, not as administrator.
+Install: py -m pip install winrt-runtime winrt-Windows.Foundation winrt-Windows.Media winrt-Windows.Media.Control winrt-Windows.Storage.Streams
+Run: py media_bridge.py --folder "C:\\path\\to\\executor\\workspace\\KotostHub"
+Only applications publishing Windows media sessions can be read/controlled.
+"""
+import argparse
+import asyncio
+import json
+import secrets
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit
+
+async def main():
+    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as Manager
+    from winrt.windows.storage.streams import DataReader
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--folder', type=Path, default=Path(__file__).resolve().parent)
+    args = parser.parse_args()
+    folder = args.folder.resolve()
+    token_path = folder / 'media_token.txt'
+    if not token_path.is_file():
+        raise SystemExit('Run Kotost Hub and enable Sound Viewer first: media_token.txt is missing.')
+    token = token_path.read_text(encoding='utf-8').strip()
+    if len(token) < 24:
+        raise SystemExit('Invalid media_token.txt; regenerate it in the hub.')
+    manager = await Manager.request_async()
+    loop = asyncio.get_running_loop()
+    state = {'connected': True, 'available': False}
+    art = b''
+    art_type = 'image/png'
+    art_key = None
+    revision = 0
+    active = None
+    lock = threading.Lock()
+    async def command(data):
+        session = manager.get_current_session()
+        if not session:
+            return {'ok': False, 'error': 'No active media session'}
+        action = data.get('action')
+        if action == 'toggle':
+            ok = await session.try_toggle_play_pause_async()
+        elif action == 'next':
+            ok = await session.try_skip_next_async()
+        elif action == 'previous':
+            ok = await session.try_skip_previous_async()
+        elif action == 'seek':
+            timeline = session.get_timeline_properties()
+            duration = (timeline.end_time - timeline.start_time).total_seconds()
+            position = float(data.get('position', 0))
+            if not 0 <= position <= max(0, duration):
+                return {'ok': False, 'error': 'Seek outside track range'}
+            ticks = int((timeline.start_time.total_seconds() + position) * 10_000_000)
+            ok = await session.try_change_playback_position_async(ticks)
+        else:
+            return {'ok': False, 'error': 'Unsupported command'}
+        return {'ok': bool(ok), 'error': '' if ok else 'Application declined this command'}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def authorized(self):
+            if self.headers.get('Origin'):
+                return False
+            if self.headers.get('Host', '') not in ('127.0.0.1:17841', 'localhost:17841'):
+                return False
+            return secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token)
+        def reply(self, value, status=200, mime='application/json'):
+            body = value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False).encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            if not self.authorized():
+                return self.reply({'error': 'Unauthorized'}, 403)
+            path = urlsplit(self.path).path
+            with lock:
+                snapshot, image, mime = dict(state), art, art_type
+            if path == '/state':
+                self.reply(snapshot)
+            elif path == '/artwork':
+                self.reply(image, 200 if image else 404, mime)
+            else:
+                self.reply({'error': 'Not found'}, 404)
+        def do_POST(self):
+            if not self.authorized():
+                return self.reply({'error': 'Unauthorized'}, 403)
+            if self.path != '/command':
+                return self.reply({'error': 'Not found'}, 404)
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= 2048:
+                    return self.reply({'error': 'Invalid body size'}, 400)
+                data = json.loads(self.rfile.read(size))
+                if not isinstance(data, dict):
+                    return self.reply({'error': 'Expected object'}, 400)
+                future = asyncio.run_coroutine_threadsafe(command(data), loop)
+                self.reply(future.result(timeout=5))
+            except Exception as exc:
+                self.reply({'ok': False, 'error': str(exc)[:250]}, 400)
+    server = ThreadingHTTPServer(('127.0.0.1', 17841), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print('Kotost media bridge listening on 127.0.0.1:17841. Close this window or press Ctrl+C to stop.')
+    try:
+        while True:
+            snapshot = {'connected': True, 'available': False, 'timestamp': time.time()}
+            try:
+                session = manager.get_current_session()
+                if session:
+                    props = await session.try_get_media_properties_async()
+                    playback = session.get_playback_info()
+                    timeline = session.get_timeline_properties()
+                    controls = playback.controls
+                    identity = (session.source_app_user_model_id, props.title, props.artist, props.album_title)
+                    if identity != art_key:
+                        image, mime = b'', 'image/png'
+                        if props.thumbnail:
+                            stream = await props.thumbnail.open_read_async()
+                            try:
+                                if 0 < stream.size <= 4 * 1024 * 1024:
+                                    reader = DataReader(stream)
+                                    try:
+                                        size = await reader.load_async(int(stream.size))
+                                        buf = bytearray(size)
+                                        reader.read_bytes(buf)
+                                        image = bytes(buf)
+                                        mime = stream.content_type or 'image/png'
+                                    finally:
+                                        reader.detach_stream()
+                                        reader.close()
+                            finally:
+                                stream.close()
+                        with lock:
+                            art, art_type = image, mime
+                            revision += 1
+                        art_key, active = identity, session
+                    snapshot.update(available=True, title=props.title or 'Untitled', artist=props.artist or '',
+                        source=session.source_app_user_model_id,
+                        playing=int(playback.playback_status) == 4,
+                        position=max(0, (timeline.position - timeline.start_time).total_seconds()),
+                        duration=max(0, (timeline.end_time - timeline.start_time).total_seconds()),
+                        can_toggle=bool(controls.is_play_pause_toggle_enabled),
+                        can_next=bool(controls.is_next_enabled), can_previous=bool(controls.is_previous_enabled),
+                        can_seek=bool(controls.is_playback_position_enabled),
+                        artwork_revision=revision, artwork_mime=art_type, has_artwork=bool(art))
+                else:
+                    art_key, active = None, None
+                    with lock:
+                        art = b''
+            except Exception as exc:
+                snapshot['error'] = str(exc)[:250]
+            with lock:
+                state = snapshot
+            await asyncio.sleep(0.5)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+]=====]
+
 function KotostApplication.start(host, game, parent)
 	local environment, diagnostics = OfflineEnvironment.create(host, game)
 	local hostGlobal = type(host.getgenv) == "function" and host.getgenv() or host
@@ -48236,7 +49115,7 @@ function KotostApplication.start(host, game, parent)
 	hostGlobal.KotostOfflineDiagnostics = diagnostics
 	hostGlobal.KotostOfflineEnvironment = environment
 	local ok, application = xpcall(function()
-		return KotostApplication.create(environment, parent, {["3.4"] = "offline"})
+		return KotostApplication.create(environment, parent, {["3.4"] = "offline"}, host)
 	end, function(message)
 		return host.debug.traceback(tostring(message), 2)
 	end)
@@ -48249,7 +49128,7 @@ function KotostApplication.start(host, game, parent)
 	return application, diagnostics
 end
 
-function KotostApplication.create(environment, parent, versions)
+function KotostApplication.create(environment, parent, versions, nativeHost)
 	local game = environment.game
 	local mobileBoot = environment.getgenv().__KotostMobile == true
 	local function breathe()
@@ -48554,8 +49433,13 @@ function KotostApplication.create(environment, parent, versions)
 		Configuration.saveWhileCurrent({environment = environment, generation = generation,
 			settings = settings, json = http})
 	end)
+	context.betaCleanup = KotostBeta.install({host = nativeHost or getfenv(), environment = environment,
+        nova = nova, window = window, general = general, visuals = visuals, connect = connect,
+        input = inputService, runService = runService, visualWorld = visualWorld})
+    if window.InvalidateSearch then window:InvalidateSearch() end
 	window.OnDestroy = function()
 		hub.dead = true
+        if context.betaCleanup then pcall(context.betaCleanup) end
 		pcall(context.stopTrolly)
 		pcall(aim.stop)
 		pcall(stopFarm)
@@ -48616,30 +49500,38 @@ function KotostApplication.create(environment, parent, versions)
 end
 
 if game then
-	local boot = getgenv().__KotostHub
-	local function launch()
-		if not boot.running then return end
-		local application, diagnostics = KotostApplication.start(getfenv(), game)
-		boot.app = application
-		boot.diagnostics = diagnostics
-	end
-	if boot and boot.play then
-		if boot.mobile then
-			local launched = false
-			local function launchOnce()
-				if launched then return end
-				launched = true
-				launch()
-			end
-			boot.play(function() end)
-			task.defer(launchOnce)
-		else
-			boot.play(launch)
-		end
-	else
-		launch()
-	end
-	return
+    local boot = getgenv().__KotostHub
+    local launched = false
+    local function launch()
+        if launched or (boot and not boot.running) then return end
+        launched = true
+        local ok, application, diagnostics = xpcall(function()
+            return KotostApplication.start(getfenv(), game)
+        end, function(err) return debug.traceback(tostring(err), 2) end)
+        if boot then boot.app = ok and application or nil; boot.diagnostics = diagnostics end
+        if not ok or not application then
+            local message = ok and diagnostics and diagnostics.errors and table.concat(diagnostics.errors, "\n") or tostring(application)
+            warn("[Kotost] startup failed: " .. tostring(message))
+            pcall(function()
+                if boot and boot.introGui then boot.introGui:Destroy() end
+                if boot and boot.introBlur then boot.introBlur:Destroy() end
+                local partial = getgenv().__kotostMM2KotostUi
+                if partial and not partial.Destroyed then partial:Destroy() end
+                local player = game:GetService("Players").LocalPlayer
+                local parent = player and player:FindFirstChildOfClass("PlayerGui")
+                if not parent then return end
+                local gui = Instance.new("ScreenGui"); gui.Name = "KotostStartupError"; gui.ResetOnSpawn = false
+                local box = Instance.new("TextButton"); box.Size = UDim2.new(0.9, 0, 0, 100); box.Position = UDim2.fromScale(0.05, 0.1)
+                box.TextWrapped = true; box.TextSize = 14; box.Font = Enum.Font.Gotham
+                box.TextColor3 = Color3.new(1, 1, 1); box.BackgroundColor3 = Color3.fromRGB(30, 20, 27)
+                box.Text = "Kotost startup error (tap to close). Details in console.\n" .. tostring(message):sub(1, 350)
+                box.Parent = gui; gui.Parent = parent
+                box.Activated:Connect(function() gui:Destroy() end)
+            end)
+        end
+    end
+    if boot and boot.play then boot.play(launch) else launch() end
+    return
 end
 
 return {
